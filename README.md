@@ -94,6 +94,26 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
+## Design of Experiments (DOE)
+
+**DOE1 — no air, depth sweep**  
+7×7 hole grid on a 97×97×11 mm plate, 12 mm pitch, 12.5 mm margins.  
+49 holes per plate run, drilled in randomised order.
+
+| Parameter | Value |
+|-----------|-------|
+| Depth levels | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0 mm |
+| Step size | 0.1 mm |
+| Control depth | 0.5 mm (holes B2, D4, F6, A4, G4) |
+| Holes per run | 49 (44 test + 5 control) |
+| Plate runs total | 31 (29 used for DL training, all 31 for classical) |
+
+The run order is randomised per plate to decorrelate depth from spatial
+position and tool wear progression. Control holes at fixed positions allow
+drift correction across runs.
+
+DOE files: [`docs/doe/`](docs/doe/)
+
 ---
 
 ## Full pipeline walkthrough
