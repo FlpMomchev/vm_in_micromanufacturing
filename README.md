@@ -34,7 +34,7 @@ vm_in_micromanufacturing/
 │   ├── classical/
 │   │   ├── trainer.py          # Grouped CV training (RF, XGB, LGB, CatBoost, GPR …)
 │   │   └── inference.py        # Bundle-based inference
-│   ├── dl/                     # Deep-learning package (migrated from DL_depth_prediction)
+│   ├── dl/                     # Deep-learning package
 │   │   ├── config.py           # TrainConfig dataclass
 │   │   ├── data.py             # WaveformWindowDataset, AudioCache
 │   │   ├── engine.py           # Train loop, predict, aggregate
@@ -61,6 +61,11 @@ vm_in_micromanufacturing/
 │   ├── infer.py                # vm-infer
 │   └── fuse.py                 # vm-fuse
 │
+├── results/                    # Benchmark results and plots (tracked by Git)
+│   ├── airborne_classical/     # ExtraTrees holdout evaluation
+│   ├── airborne_dl/            # SpecResNet unseen-run evaluation
+│   └── RESULTS.md              # Full breakdown with all plots
+│
 ├── notebooks/
 │   ├── air_influence_exploration/   # Legacy milling notebooks (01-04)
 │   └── analysis/                    # side_effect_control, holdout_reliability …
@@ -71,6 +76,7 @@ vm_in_micromanufacturing/
 │   ├── test_classical.py       # Classical ML training + inference round-trip
 │   └── test_fusion.py          # Fusion layer interface + uncertainty propagation
 │
+├── docs/doe/                   # DOE Excel manifests
 ├── outputs/                    # Local model artefacts (git-ignored)
 ├── pyproject.toml
 └── .gitignore
@@ -94,17 +100,19 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
+---
+
 ## Design of Experiments (DOE)
 
-**DOE1 — no air, depth sweep**  
-7×7 hole grid on a 97×97×11 mm plate, 12 mm pitch, 12.5 mm margins.  
+**DOE1 — no air, depth sweep**
+7×7 hole grid on a 97×97×11 mm plate, 12 mm pitch, 12.5 mm margins.
 49 holes per plate run, drilled in randomised order.
 
 | Parameter | Value |
 |-----------|-------|
 | Depth levels | 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0 mm |
 | Step size | 0.1 mm |
-| Control depth | 0.5 mm (holes B2, D4, F6, A4, G4) |
+| Control depth | 0.5 mm (5 fixed control holes per plate) |
 | Holes per run | 49 (44 test + 5 control) |
 | Plate runs total | 31 (29 used for DL training, all 31 for classical) |
 
@@ -116,6 +124,64 @@ DOE files: [`docs/doe/`](docs/doe/)
 
 ---
 
+## Results (airborne acoustics, current)
+
+> Full breakdown with all plots, per-depth analysis, and feature importances: **[`results/RESULTS.md`](results/RESULTS.md)**
+
+All evaluation uses **complete plate runs as holdout units** — the model never
+sees any hole from a holdout run during training, feature selection, or
+hyperparameter tuning. This is the only protocol that reflects real deployment.
+
+### Classical ML — ExtraTrees on 20 acoustic features
+
+| Metric | Value |
+|--------|-------|
+| MAE | **0.032 mm** |
+| RMSE | 0.046 mm |
+| R² | 0.975 |
+| P90 abs error | 0.071 mm |
+| Nested CV MAE (31 runs, OOF) | 0.056 mm |
+| Goal < 0.05 mm MAE | ✓ met |
+
+Holdout: 7 complete plate runs, 343 holes, excluded from all phases.
+
+### Deep Learning — SpecResNet regression
+
+| Metric | Value |
+|--------|-------|
+| MAE | **0.002 mm** |
+| RMSE | 0.002 mm |
+| R² | 0.9999 |
+| Step accuracy (±0.05 mm) | 100 % |
+
+Holdout: 2 complete plate runs, 98 holes, never seen in any training phase.
+
+The DOE step size is 0.1 mm. Classical MAE = **32 %** of one step.
+DL MAE on unseen runs = **2 %** of one step.
+
+> Structure-borne and fused results will be added as soon as those pipelines are
+> completed.
+
+---
+
+## Running tests
+
+```bash
+pytest -v        # all tests, verbose
+pytest --co      # list collected tests without running
+```
+
+**42 / 42 tests pass on a clean install** — 100 % pass rate.
+
+The suite covers data I/O and segmentation (FLAC + HDF5 fixtures, full
+detect → segment → pad → export cycle), all feature extraction families
+with analytical ground-truth checks, classical ML training and inference
+round-trip with a synthetic grouped dataset, and the full fusion layer
+including weight computation, Gaussian uncertainty propagation, and record
+intersection alignment.
+
+---
+
 ## Full pipeline walkthrough
 
 ### 1 · Segment recordings into per-hole files
@@ -123,20 +189,20 @@ DOE files: [`docs/doe/`](docs/doe/)
 ```bash
 # Single file
 vm-split single \
-    --input raw_data/airborne/0503_1_2_4532.flac \
-    --out-dir all_outputs/0503_1_2_4532 \
+    --input raw_data/airborne/<recording>.flac \
+    --out-dir all_outputs/<recording> \
     --segments-per-file 49
 
-# Batch (all runs, with DOE mapping and canonical filenames)
+# Batch with DOE mapping and canonical filenames
 vm-split batch --preset normalBand
 
-# Custom band (for runs that need a different detection frequency)
+# Custom detection band (adjust per recording if needed)
 vm-split batch --preset largerBand
 
-# Structure-borne HDF5 (same CLI, auto-detected format)
+# Structure-borne HDF5 (format auto-detected)
 vm-split single \
-    --input raw_data/structure_borne/0503_1_2_4532.h5 \
-    --out-dir all_outputs/structure/0503_1_2_4532 \
+    --input raw_data/structure_borne/<recording>.h5 \
+    --out-dir all_outputs/structure/<recording> \
     --segments-per-file 49 \
     --band-low 200 --band-high 1000
 ```
@@ -172,7 +238,7 @@ vm-select \
 vm-train-cls \
     --features-csv outputs/features/airborne/features_selected.csv \
     --out-dir      outputs/features/airborne \
-    --holdout-runs 0303_3_1_8881 0503_7_2_9976
+    --holdout-runs <run_id_1> <run_id_2>
 ```
 
 ### 5 · Train DL models
@@ -183,14 +249,14 @@ vm-train-dl \
     --data-dir    all_outputs \
     --output-dir  outputs/dl/hybrid_cls \
     --task        classification \
-    --exclude-runs 0303_3_1_8881 0503_7_2_9976
+    --exclude-runs <run_id_1> <run_id_2>
 
 # Regression
 vm-train-dl \
     --data-dir    all_outputs \
     --output-dir  outputs/dl/hybrid_reg \
     --task        regression \
-    --exclude-runs 0303_3_1_8881 0503_7_2_9976
+    --exclude-runs <run_id_1> <run_id_2>
 ```
 
 ### 6 · Run inference
@@ -213,28 +279,18 @@ vm-infer dl \
 # Stage 1: airborne classical + DL
 vm-fuse intra \
     --classical-csv outputs/features/airborne/inference_predictions.csv \
-    --classical-mae 0.042 \
+    --classical-mae <value> \
     --dl-csv        outputs/dl/hybrid_cls/inference_predictions.csv \
-    --dl-mae        0.038 \
+    --dl-mae        <value> \
     --modality      airborne_ensemble \
     --out-dir       outputs/fusion/airborne
 
 # Stage 2: airborne + structure-borne (once structure-borne is trained)
 vm-fuse inter \
     --bundle-csvs \
-        outputs/fusion/airborne/fusion_predictions.csv:0.040:airborne_ensemble \
-        outputs/fusion/structure/fusion_predictions.csv:0.055:structure_ensemble \
+        outputs/fusion/airborne/fusion_predictions.csv:<mae>:airborne_ensemble \
+        outputs/fusion/structure/fusion_predictions.csv:<mae>:structure_ensemble \
     --out-dir outputs/fusion/final
-```
-
----
-
-## Running tests
-
-```bash
-pytest                  # all tests
-pytest -v tests/test_fusion.py    # single module
-pytest --co             # list collected tests without running
 ```
 
 ---
@@ -244,20 +300,19 @@ pytest --co             # list collected tests without running
 ```
 raw_data/
   airborne/
-    normalBand/    *.flac   (28 runs)
-    largerBand/    *.flac   (2 runs)
+    normalBand/    *.flac
+    largerBand/    *.flac
   structure_borne/ *.h5     (future)
   Versuchsplan__Bohrungen.xlsx
 
-all_outputs/       per-run subfolders, each containing:
+all_outputs/       per-run subfolders, each containing segmented files:
   <run_stem>/
-    <run_stem>__seg001__step001__B2__depth0.500.flac
-    ...
+    <run_stem>__seg001__step001__<hole>__depth<d>.flac
     <run_stem>__debug__core.png
     <run_stem>__debug__padded.png
 
-unseen/            held-out test files (0303_3_1_8881, 0503_7_2_9976)
-inflated/          Audacity-augmented files for stress testing
+unseen/            held-out test recordings
+inflated/          augmented files for stress testing
 
 outputs/           (git-ignored)
   dl/<model_tag>/final_model/best_model.pt
@@ -304,4 +359,4 @@ any training or extraction code.
 
 ## Citation / acknowledgements
 
-*Filip [surname] — Master's thesis, [Institution], 2026.*
+*Filip Momchev — Acoustic Sensor Fusion for Quality Prediction in Micro-Manufacturing: Evaluating Structure-Borne and Airborne Sound (Master's Thesis), Karlsruher Institut für Technologie, 2026.*

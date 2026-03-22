@@ -13,7 +13,7 @@ from vm_micro.features.core import (
     compute_machining_features,
     compute_short_time_features,
     compute_statistical_features,
-    compute_time_features,
+    compute_time_features
 )
 
 SR = 48_000

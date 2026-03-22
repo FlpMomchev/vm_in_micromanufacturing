@@ -75,7 +75,7 @@ def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, flo
         "mae":  float(mean_absolute_error(y_true, y_pred)),
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
         "r2":   float(r2_score(y_true, y_pred)),
-        "mean_signed_error": float(np.mean(y_pred - y_true)),
+        "mean_signed_error": float(np.mean(y_pred - y_true))
     }
 
 
@@ -85,36 +85,36 @@ def _build_models(skip_slow: bool = False) -> dict[str, Any]:
         "RandomForest": Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("scl", StandardScaler()),
-            ("mdl", RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)),
+            ("mdl", RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1))
         ]),
         "ExtraTrees": Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("scl", StandardScaler()),
-            ("mdl", ExtraTreesRegressor(n_estimators=300, random_state=42, n_jobs=-1)),
+            ("mdl", ExtraTreesRegressor(n_estimators=300, random_state=42, n_jobs=-1))
         ]),
         "HistGBT": Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("scl", StandardScaler()),
-            ("mdl", HistGradientBoostingRegressor(max_iter=500, random_state=42)),
+            ("mdl", HistGradientBoostingRegressor(max_iter=500, random_state=42))
         ]),
         "Ridge": Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("scl", StandardScaler()),
-            ("mdl", Ridge(alpha=1.0)),
+            ("mdl", Ridge(alpha=1.0))
         ]),
         "ElasticNet": Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("scl", StandardScaler()),
-            ("mdl", ElasticNet(max_iter=5000, random_state=42)),
+            ("mdl", ElasticNet(max_iter=5000, random_state=42))
         ]),
         "GPR": Pipeline([
             ("imp", SimpleImputer(strategy="median")),
             ("scl", StandardScaler()),
             ("mdl", GaussianProcessRegressor(
                 kernel=ConstantKernel(1.0) * RBF(1.0) + WhiteKernel(0.1),
-                n_restarts_optimizer=3, random_state=42,
-            )),
-        ]),
+                n_restarts_optimizer=3, random_state=42
+            ))
+        ])
     }
 
     if _HAS_XGB:
@@ -123,8 +123,8 @@ def _build_models(skip_slow: bool = False) -> dict[str, Any]:
             ("scl", StandardScaler()),
             ("mdl", XGBRegressor(
                 n_estimators=500, learning_rate=0.05, tree_method="hist",
-                device="cpu", n_jobs=1, random_state=42, verbosity=0,
-            )),
+                device="cpu", n_jobs=1, random_state=42, verbosity=0
+            ))
         ])
     if _HAS_LGB:
         models["LightGBM"] = Pipeline([
@@ -132,7 +132,7 @@ def _build_models(skip_slow: bool = False) -> dict[str, Any]:
             ("scl", StandardScaler()),
             ("mdl", LGBMRegressor(
                 n_estimators=500, learning_rate=0.05,
-                device="cpu", n_jobs=1, random_state=42, verbose=-1,
+                device="cpu", n_jobs=1, random_state=42, verbose=-1
             )),
         ])
     if _HAS_CAT:
@@ -141,8 +141,8 @@ def _build_models(skip_slow: bool = False) -> dict[str, Any]:
             ("scl", StandardScaler()),
             ("mdl", CatBoostRegressor(
                 iterations=500, learning_rate=0.05, task_type="CPU",
-                random_seed=42, verbose=0, eval_metric="MAE",
-            )),
+                random_seed=42, verbose=0, eval_metric="MAE"
+            ))
         ])
 
     return models
@@ -161,7 +161,7 @@ def train_classical(
     train_fraction: float = 0.70,
     n_cv_folds: int = 5,
     skip_slow_models: bool = False,
-    seed: int = 42,
+    seed: int = 42
 ) -> dict[str, Any]:
     """Train all classical ML models with grouped holdout + nested CV.
 
@@ -268,7 +268,7 @@ def train_classical(
         "sigma_pred": sigma_pred,
         "sigma_mae": sigma_mae,
         "total_uncertainty": total_uncertainty,
-        "modality": "airborne_classical",  # overridden by caller for structure
+        "modality": "airborne_classical"  # overridden by caller for structure
     }
     joblib.dump(bundle, final_dir / "best_model_bundle.joblib")
 
@@ -283,7 +283,7 @@ def train_classical(
         "sigma_pred":        sigma_pred,
         "sigma_mae":         sigma_mae,
         "total_uncertainty": total_uncertainty,
-        "cv_mean_mae":       float(repeat_summary.loc[best_model_name, "mean"]),
+        "cv_mean_mae":       float(repeat_summary.loc[best_model_name, "mean"])
     }
     with open(final_dir / "best_model_metadata.json", "w") as fh:
         json.dump(metadata, fh, indent=2)
@@ -301,7 +301,7 @@ def train_classical(
         "repeat_metrics_df": repeat_df,
         "out_dir":           str(out_dir),
         "bundle_path":       str(final_dir / "best_model_bundle.joblib"),
-        "total_uncertainty": total_uncertainty,
+        "total_uncertainty": total_uncertainty
     }
 
 

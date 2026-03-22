@@ -46,7 +46,7 @@ def load_expected_map_csv(csv_path: str | Path) -> dict[str, int]:
 
 def map_segments_to_doe(
     doe_df: pd.DataFrame,
-    n_segments: int,
+    n_segments: int
 ) -> pd.DataFrame:
     """Return a DOE slice for the first *n_segments* rows.
 
@@ -66,7 +66,7 @@ def map_segments_to_doe(
                 "HoleID": [pd.NA] * extra_n,
                 "Depth_mm": [pd.NA] * extra_n,
                 "doe_row_index0": np.arange(n_doe, n_doe + extra_n, dtype=int),
-                "status": ["extra_segment"] * extra_n,
+                "status": ["extra_segment"] * extra_n
             }
         )
         mapped = pd.concat([mapped, extras], ignore_index=True)
@@ -137,7 +137,7 @@ def build_segment_filename(
     step: object,
     hole: object,
     depth: object,
-    ext: str,
+    ext: str
 ) -> str:
     """Construct the canonical segment filename.
 

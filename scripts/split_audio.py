@@ -68,7 +68,7 @@ BATCH_PRESETS: dict[str, dict[str, Any]] = {
             "0503_10_2_7913": 49,"0503_11_1_2786": 49,"0503_12_1_6520": 49,
             "0503_11_2_2159": 49,"0503_12_2_8250": 49,"0503_13_1_1188": 49,
             "0503_13_2_5115": 49,"0503_14_1_1553": 49,"0503_14_2_7317": 49,
-            "0503_6_2_3712": 49,
+            "0503_6_2_3712": 49
         },
     },
     "largerBand": {
@@ -82,7 +82,7 @@ BATCH_PRESETS: dict[str, dict[str, Any]] = {
         "BAND_HZ":   (100.0, 5000.0),
         "EXPECTED_MAP": {
             "0303_3_1_8881": 49,
-            "0503_3_2_8200": 49,
+            "0503_3_2_8200": 49
         },
     },
     "structure": {
@@ -94,8 +94,8 @@ BATCH_PRESETS: dict[str, dict[str, Any]] = {
         "PRE_PAD_S":  0.05,
         "POST_PAD_S": 0.05,
         "BAND_HZ":   (200.0, 1000.0),
-        "EXPECTED_MAP": {},  # populate when structure-borne data is available
-    },
+        "EXPECTED_MAP": {}  # populate when structure-borne data is available
+    }
 }
 
 

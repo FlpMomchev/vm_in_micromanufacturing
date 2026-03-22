@@ -15,19 +15,19 @@ from vm_micro.data.io import (
     get_input_kind,
     read_audio_mono,
     read_measurement_h5,
-    read_signal_auto,
+    read_signal_auto
 )
 from vm_micro.data.manifest import (
     build_segment_filename,
     extract_recording_root,
     parse_depth_mm,
     try_parse_depth_mm,
-    try_parse_step_idx,
+    try_parse_step_idx
 )
 from vm_micro.data.splitter import (
     apply_padding,
     band_envelope_db,
-    detect_segments,
+    detect_segments
 )
 
 

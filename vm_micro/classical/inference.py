@@ -53,8 +53,8 @@ def infer_classical(
     out = df[["record_name"]].copy()
     if "depth_mm" in df.columns:
         out["depth_mm"] = df["depth_mm"].values
-    out["y_pred"]    = pred
-    out["modality"]  = modality
+    out["y_pred"]      = pred
+    out["modality"]    = modality
     out["holdout_mae"] = holdout_mae
     out["sigma_pred"]  = sigma_pred
     out["sigma_mae"]   = sigma_mae

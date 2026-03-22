@@ -14,7 +14,7 @@ from vm_micro.fusion.fuser import (
     fuse_intra_modality,
     fuse_modalities,
     load_bundle_from_csv,
-    save_fusion_report,
+    save_fusion_report
 )
 
 

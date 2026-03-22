@@ -32,7 +32,7 @@ from .manifest import (
     build_segment_filename,
     load_doe,
     load_expected_map_csv,
-    map_segments_to_doe,
+    map_segments_to_doe
 )
 
 
@@ -45,7 +45,7 @@ def band_envelope_db(
     sr: int,
     band_hz: tuple[float, float] = (2000.0, 5000.0),
     win_ms: float = 21.0,
-    hop_ms: float = 5.0,
+    hop_ms: float = 5.0
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (times, envelope_dB) for the specified frequency band."""
     nperseg  = max(256, int(sr * win_ms / 1000.0))
@@ -54,7 +54,7 @@ def band_envelope_db(
     f, t, Zxx = signal.stft(
         y, fs=sr, window="hann",
         nperseg=nperseg, noverlap=noverlap,
-        detrend=False, boundary=None, padded=False,
+        detrend=False, boundary=None, padded=False
     )
     P = (np.abs(Zxx) ** 2).astype(np.float64)
     lo, hi = band_hz
@@ -295,7 +295,7 @@ def detect_segments(
     min_off_frac: float = 0.08,
     merge_gap_frac: float   = 0.05,
     min_valley_frac: float  = 0.20,
-    min_keep_frac: float    = 0.10,
+    min_keep_frac: float    = 0.10
 ) -> tuple[list[tuple[float, float]], dict[str, Any]]:
     """Detect drilling segments using baseline-relative IDLE/ACTIVE machine.
 
@@ -373,7 +373,7 @@ def detect_segments(
         thr_on=thr_on, thr_off=thr_off, typical_s=typical_s,
         smooth_win_s=smooth_win_s, baseline_win_s=baseline_win_s,
         min_on_s=min_on_s, min_off_s=min_off_s,
-        merge_gap_s=merge_gap_s, min_valley_s=min_valley_s, min_keep_s=min_keep_s,
+        merge_gap_s=merge_gap_s, min_valley_s=min_valley_s, min_keep_s=min_keep_s
     )
     return segs_s, dbg
 
@@ -385,7 +385,7 @@ def refine_segment_edges(
     lookahead_s: float = 0.25,
     on_ratio: float = 0.50,
     off_ratio: float = 1.00,
-    snap_min_window_s: float = 0.08,
+    snap_min_window_s: float = 0.08
 ) -> list[tuple[float, float]]:
     """Adjust segment edges using a relaxed threshold within limited windows."""
     t    = np.asarray(dbg["times"])
@@ -437,7 +437,7 @@ def apply_padding(
     segs_s: list[tuple[float, float]],
     pre_pad_s: float,
     post_pad_s: float,
-    duration_s: float,
+    duration_s: float
 ) -> list[tuple[float, float]]:
     out = []
     for a, b in segs_s:
@@ -477,7 +477,7 @@ def _write_h5_segment(
     time_vector: np.ndarray,
     data_key: str,
     time_key: str,
-    attrs: dict[str, Any] | None,
+    attrs: dict[str, Any] | None
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     group, dname = data_key.rsplit("/", 1)
@@ -505,7 +505,7 @@ def export_segments(
     input_kind: str,
     time_vector: np.ndarray | None = None,
     h5_data_key: str = "measurement/data",
-    h5_time_key: str = "measurement/time_vector",
+    h5_time_key: str = "measurement/time_vector"
 ) -> list[Path]:
     """Write one file per segment; return output paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -528,7 +528,7 @@ def export_segments(
             tv = tv_full[s0:s1] if tv_full is not None else _make_time_vector(len(chunk), sr, a)
             _write_h5_segment(
                 p, chunk, tv, h5_data_key, h5_time_key,
-                attrs={"sample_rate_hz": int(sr), "segment_start_s": a, "segment_end_s": b},
+                attrs={"sample_rate_hz": int(sr), "segment_start_s": a, "segment_end_s": b}
             )
         elif fmt == "npz":
             tv = tv_full[s0:s1] if tv_full is not None else _make_time_vector(len(chunk), sr, a)
@@ -628,7 +628,7 @@ def process_one_file(
             "start_sample": int(s0),         "end_sample": int(s1),
             "time_jitter_rel": float(sig.get("relative_time_jitter", 0.0)),
             "output_path": str(p.relative_to(out_root)),
-            **row,
+            **row
         })
 
     return pd.DataFrame(rows), {
@@ -636,7 +636,7 @@ def process_one_file(
         "expected_segments": int(expected_segments),
         "detected_segments_core": int(len(segs_s)),
         "exported_segments_final": int(len(segs_final)),
-        "out_dir": str(out_dir),
+        "out_dir": str(out_dir)
     }
 
 
@@ -652,7 +652,7 @@ def process_batch(
     export_format: str = "auto",
     h5_data_key: str = "measurement/data",
     h5_time_key: str = "measurement/time_vector",
-    target_sr: int | None = None,
+    target_sr: int | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Batch-process a list of recordings; write manifest.csv; return (manifest, summary)."""
     out_root.mkdir(parents=True, exist_ok=True)

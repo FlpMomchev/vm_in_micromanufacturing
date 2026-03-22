@@ -39,14 +39,14 @@ from vm_micro.dl.training import (
     choose_final_training_epochs,
     fit_final_model_all_files,
     fit_repeated_experiment,
-    make_main_split_builder,
+    make_main_split_builder
 )
 from vm_micro.dl.utils import (
     add_class_labels,
     attach_step_idx_if_possible,
     build_file_table,
     choose_device,
-    dump_json,
+    dump_json
 )
 from vm_micro.utils import load_config, apply_overrides, get_logger
 
