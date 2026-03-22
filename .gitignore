@@ -29,6 +29,7 @@ outputs/
 outputs_DL*/
 outputs_features*/
 outputs_structure*/
+catboost_info*/
 
 # Data (never commit raw or processed data)
 raw_data*/
