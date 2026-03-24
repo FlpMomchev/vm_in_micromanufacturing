@@ -3,24 +3,22 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from vm_micro.classical.trainer import train_classical
 from vm_micro.classical.inference import infer_classical
-
+from vm_micro.classical.trainer import train_classical
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Synthetic feature dataset
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DEPTHS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-_RUNS   = [f"run_{i:02d}" for i in range(10)]
-_N_PER  = 5   # segments per run × depth level
+_RUNS = [f"run_{i:02d}" for i in range(10)]
+_N_PER = 5  # segments per run × depth level
 
 
 def _make_synthetic_features(rng: np.random.Generator) -> pd.DataFrame:
@@ -29,16 +27,18 @@ def _make_synthetic_features(rng: np.random.Generator) -> pd.DataFrame:
     for run_id, run in enumerate(_RUNS):
         for step, depth in enumerate(_DEPTHS):
             for seg in range(_N_PER):
-                stem = f"{run}__seg{step * _N_PER + seg + 1:03d}__step{step:03d}__B1__depth{depth:.3f}"
+                stem = (
+                    f"{run}__seg{step * _N_PER + seg + 1:03d}__step{step:03d}__B1__depth{depth:.3f}"
+                )
                 row = {
-                    "record_name":     stem,
-                    "recording_root":  run,
-                    "depth_mm":        depth,
-                    "modality":        "airborne",
+                    "record_name": stem,
+                    "recording_root": run,
+                    "depth_mm": depth,
+                    "modality": "airborne",
                     # synthetic features — correlated with depth
                     "feat_a": depth * 2.0 + rng.normal(0, 0.1),
-                    "feat_b": depth ** 2   + rng.normal(0, 0.05),
-                    "feat_c": -depth       + rng.normal(0, 0.15),
+                    "feat_b": depth**2 + rng.normal(0, 0.05),
+                    "feat_c": -depth + rng.normal(0, 0.15),
                     "feat_d": rng.normal(0, 1.0),  # noise feature
                 }
                 rows.append(row)
@@ -49,8 +49,8 @@ def _make_synthetic_features(rng: np.random.Generator) -> pd.DataFrame:
 def features_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
     tmp = tmp_path_factory.mktemp("features")
     rng = np.random.default_rng(42)
-    df  = _make_synthetic_features(rng)
-    p   = tmp / "features_selected.csv"
+    df = _make_synthetic_features(rng)
+    p = tmp / "features_selected.csv"
     df.to_csv(p, index=False)
     return p
 
@@ -58,6 +58,7 @@ def features_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @pytest.fixture(scope="module")
 def trained_bundle(features_csv: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
@@ -97,6 +98,7 @@ def test_train_uncertainty_positive(trained_bundle: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 # Inference
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_inference_round_trip(
     trained_bundle: Path,

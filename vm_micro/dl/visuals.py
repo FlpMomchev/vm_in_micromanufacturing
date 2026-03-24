@@ -5,12 +5,11 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.decomposition import PCA
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
-import torch
 
 from .config import TrainConfig
-
 
 
 def _safe_plot_dir(root: str | Path) -> Path:
@@ -19,14 +18,12 @@ def _safe_plot_dir(root: str | Path) -> Path:
     return out_dir
 
 
-
 def _save_fig(fig: plt.Figure, out_path: str | Path) -> None:
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(out_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
-
 
 
 def save_training_overview_plots(
@@ -44,10 +41,11 @@ def save_training_overview_plots(
         save_regression_scatter_plot(file_pred_df, out_dir / "regression_true_vs_pred.png")
         save_error_by_depth_plot(file_pred_df, out_dir / "regression_error_by_depth.png")
         save_abs_error_hist_plot(file_pred_df, out_dir / "regression_abs_error_distribution.png")
-        save_signed_error_by_depth_plot(file_pred_df, out_dir / "regression_signed_error_by_depth.png")
+        save_signed_error_by_depth_plot(
+            file_pred_df, out_dir / "regression_signed_error_by_depth.png"
+        )
 
     save_embedding_pca_plot(file_pred_df, out_dir / "embedding_pca.png")
-
 
 
 def save_confusion_matrix_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
@@ -67,7 +65,6 @@ def save_confusion_matrix_plot(file_pred_df: pd.DataFrame, out_path: str | Path)
     ax.set_xticklabels(classes)
     ax.set_yticklabels(classes)
     _save_fig(fig, out_path)
-
 
 
 def save_per_class_metrics_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
@@ -98,7 +95,6 @@ def save_per_class_metrics_plot(file_pred_df: pd.DataFrame, out_path: str | Path
     _save_fig(fig, out_path)
 
 
-
 def save_confidence_distribution_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
     prob_cols = [col for col in file_pred_df.columns if col.startswith("p_")]
     if not prob_cols:
@@ -110,7 +106,6 @@ def save_confidence_distribution_plot(file_pred_df: pd.DataFrame, out_path: str 
     ax.set_ylabel("Count")
     ax.set_title("Prediction confidence distribution")
     _save_fig(fig, out_path)
-
 
 
 def save_regression_scatter_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
@@ -128,7 +123,6 @@ def save_regression_scatter_plot(file_pred_df: pd.DataFrame, out_path: str | Pat
     _save_fig(fig, out_path)
 
 
-
 def save_error_by_depth_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
     df = file_pred_df.copy()
     df["abs_error"] = (df["y_true_depth"] - df["y_pred_depth"]).abs()
@@ -140,7 +134,6 @@ def save_error_by_depth_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -
     ax.set_ylabel("Mean absolute error [mm]")
     ax.set_title("Regression error by depth level")
     _save_fig(fig, out_path)
-
 
 
 def save_signed_error_by_depth_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
@@ -157,7 +150,6 @@ def save_signed_error_by_depth_plot(file_pred_df: pd.DataFrame, out_path: str | 
     _save_fig(fig, out_path)
 
 
-
 def save_abs_error_hist_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
     err = np.abs(file_pred_df["y_true_depth"].to_numpy() - file_pred_df["y_pred_depth"].to_numpy())
     fig, ax = plt.subplots(figsize=(7.0, 4.2))
@@ -166,7 +158,6 @@ def save_abs_error_hist_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -
     ax.set_ylabel("Count")
     ax.set_title("Absolute error distribution")
     _save_fig(fig, out_path)
-
 
 
 def save_embedding_pca_plot(file_pred_df: pd.DataFrame, out_path: str | Path) -> None:
@@ -184,7 +175,6 @@ def save_embedding_pca_plot(file_pred_df: pd.DataFrame, out_path: str | Path) ->
     ax.set_ylabel("PC2")
     ax.set_title("Embedding PCA by true depth")
     _save_fig(fig, out_path)
-
 
 
 def save_attention_maps_for_examples(
@@ -251,12 +241,16 @@ def save_attention_maps_for_examples(
         h_tokens, w_tokens = out["token_grid_hw"]
         attn_2d = attn.reshape(h_tokens, w_tokens)
         attn_img = torch.tensor(attn_2d, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-        attn_img = torch.nn.functional.interpolate(
-            attn_img,
-            size=spec.shape,
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze().numpy()
+        attn_img = (
+            torch.nn.functional.interpolate(
+                attn_img,
+                size=spec.shape,
+                mode="bilinear",
+                align_corners=False,
+            )
+            .squeeze()
+            .numpy()
+        )
 
         fig, ax = plt.subplots(figsize=(8.0, 4.5))
         ax.imshow(spec, aspect="auto", origin="lower")

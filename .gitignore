@@ -23,6 +23,7 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+21and23.ipynb
 
 # Project outputs (large, local only)
 outputs/

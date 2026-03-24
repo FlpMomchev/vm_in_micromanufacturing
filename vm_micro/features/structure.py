@@ -55,8 +55,7 @@ def extract_one_file(
     try:
         h5_data_key = str(cfg.get("h5_data_key", "measurement/data"))
         h5_time_key = str(cfg.get("h5_time_key", "measurement/time_vector"))
-        native_sr   = int(cfg.get("native_sr", 3_125_000))
-        ds_rate     = int(cfg.get("ds_rate", 1000))
+        ds_rate = int(cfg.get("ds_rate", 1000))
 
         y_raw, sr_native, _tv, _meta = read_measurement_h5(
             path,
@@ -76,51 +75,59 @@ def extract_one_file(
         families: dict[str, bool] = cfg.get("feature_families", {})
         feats: dict[str, float] = {}
 
-        if families.get("time",        True): feats.update(compute_time_features(y, sr))
-        if families.get("frequency",   True): feats.update(compute_frequency_features(y, sr))
-        if families.get("band_power",  True):
+        if families.get("time", True):
+            feats.update(compute_time_features(y, sr))
+        if families.get("frequency", True):
+            feats.update(compute_frequency_features(y, sr))
+        if families.get("band_power", True):
             nyq = sr / 2.0
-            bands = [
-                (10.0,   100.0),
-                (100.0,  500.0),
-                (500.0, min(nyq - 1, 1500.0)),
-            ]
+            bands = [(10.0, 100.0), (100.0, 500.0), (500.0, min(nyq - 1, 1500.0))]
             feats.update(compute_band_power_features(y, sr, bands=bands))
-        if families.get("statistical", True): feats.update(compute_statistical_features(y, sr))
-        if families.get("short_time",  True):
-            feats.update(compute_short_time_features(
-                y, sr,
-                frame_ms=float(cfg.get("short_time_frame_ms", 10.0)),
-                hop_ms  =float(cfg.get("short_time_hop_ms",    5.0)),
-            ))
-        if families.get("dwt",         True):
-            feats.update(compute_dwt_features(
-                y, sr,
-                wavelet  =str(cfg.get("dwt_wavelet",   "sym8")),
-                max_level=int(cfg.get("dwt_level",       5)),
-            ))
-        if families.get("cwt",         True):
-            feats.update(compute_cwt_features(
-                y, sr,
-                wavelet   =str(cfg.get("cwt_wavelet",    "morl")),
-                num_scales=int(cfg.get("cwt_num_scales",   64)),
-                fmin      =float(cfg.get("cwt_fmin",      50.0)),
-                fmax      =float(cfg.get("cwt_fmax",    1562.0)),
-            ))
+        if families.get("statistical", True):
+            feats.update(compute_statistical_features(y, sr))
+        if families.get("short_time", True):
+            feats.update(
+                compute_short_time_features(
+                    y,
+                    sr,
+                    frame_ms=float(cfg.get("short_time_frame_ms", 10.0)),
+                    hop_ms=float(cfg.get("short_time_hop_ms", 5.0)),
+                )
+            )
+        if families.get("dwt", True):
+            feats.update(
+                compute_dwt_features(
+                    y,
+                    sr,
+                    wavelet=str(cfg.get("dwt_wavelet", "sym8")),
+                    max_level=int(cfg.get("dwt_level", 5)),
+                )
+            )
+        if families.get("cwt", True):
+            feats.update(
+                compute_cwt_features(
+                    y,
+                    sr,
+                    wavelet=str(cfg.get("cwt_wavelet", "morl")),
+                    num_scales=int(cfg.get("cwt_num_scales", 64)),
+                    fmin=float(cfg.get("cwt_fmin", 50.0)),
+                    fmax=float(cfg.get("cwt_fmax", 1562.0)),
+                )
+            )
         # machining proxy intentionally omitted for structure-borne
 
         stem = path.stem
         meta: dict[str, Any] = {
-            "modality":        "structure",
-            "record_name":     stem,
-            "recording_root":  extract_recording_root(stem),
-            "depth_mm":        try_parse_depth_mm(stem),
-            "step_idx":        try_parse_step_idx(stem),
-            "duration_s":      float(len(y) / sr),
-            "sr_hz_native":    int(sr_native),
-            "sr_hz_used":      int(sr),
-            "ds_rate":         int(ds_rate),
-            "file_path":       str(path),
+            "modality": "structure",
+            "record_name": stem,
+            "recording_root": extract_recording_root(stem),
+            "depth_mm": try_parse_depth_mm(stem),
+            "step_idx": try_parse_step_idx(stem),
+            "duration_s": float(len(y) / sr),
+            "sr_hz_native": int(cfg.get("native_sr", 3_125_000)),
+            "sr_hz_used": int(sr),
+            "ds_rate": int(ds_rate),
+            "file_path": str(path),
         }
         return {**meta, **feats}
 
@@ -184,7 +191,8 @@ def extract_structure(
         df.to_csv(out_csv, index=False)
         logger.info(
             "Saved structure-borne features to %s  (%d rows × %d cols)",
-            out_csv, *df.shape,
+            out_csv,
+            *df.shape,
         )
 
     return df

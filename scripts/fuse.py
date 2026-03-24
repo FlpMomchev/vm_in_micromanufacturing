@@ -44,29 +44,32 @@ logger = get_logger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="vm-fuse",
-                                description="Fuse model predictions with inverse-MAE weighting.")
+    p = argparse.ArgumentParser(
+        prog="vm-fuse", description="Fuse model predictions with inverse-MAE weighting."
+    )
     sub = p.add_subparsers(dest="stage", required=True)
 
     # ── intra ─────────────────────────────────────────────────────────────────
     ip = sub.add_parser("intra", help="Stage 1: fuse classical + DL for one modality.")
     ip.add_argument("--classical-csv", required=True)
     ip.add_argument("--classical-mae", required=True, type=float)
-    ip.add_argument("--dl-csv",        required=True)
-    ip.add_argument("--dl-mae",        required=True, type=float)
+    ip.add_argument("--dl-csv", required=True)
+    ip.add_argument("--dl-mae", required=True, type=float)
     ip.add_argument("--classical-modality", default="airborne_classical")
-    ip.add_argument("--dl-modality",        default="airborne_dl")
-    ip.add_argument("--modality",      default="airborne_ensemble",
-                    help="Name for the fused output modality.")
-    ip.add_argument("--out-dir",       required=True)
-    ip.add_argument("--min-weight",    type=float, default=0.05)
+    ip.add_argument("--dl-modality", default="airborne_dl")
+    ip.add_argument(
+        "--modality", default="airborne_ensemble", help="Name for the fused output modality."
+    )
+    ip.add_argument("--out-dir", required=True)
+    ip.add_argument("--min-weight", type=float, default=0.05)
 
     # ── inter ─────────────────────────────────────────────────────────────────
     fp = sub.add_parser("inter", help="Stage 2: fuse multiple modality ensembles.")
-    fp.add_argument("--bundle-csvs", nargs="+", required=True,
-                    help="<csv>:<mae>:<modality> triples.")
-    fp.add_argument("--out-dir",     required=True)
-    fp.add_argument("--min-weight",  type=float, default=0.05)
+    fp.add_argument(
+        "--bundle-csvs", nargs="+", required=True, help="<csv>:<mae>:<modality> triples."
+    )
+    fp.add_argument("--out-dir", required=True)
+    fp.add_argument("--min-weight", type=float, default=0.05)
 
     return p
 
@@ -78,11 +81,10 @@ def main() -> None:
         cls_bundle = load_bundle_from_csv(
             args.classical_csv, args.classical_modality, args.classical_mae
         )
-        dl_bundle  = load_bundle_from_csv(
-            args.dl_csv, args.dl_modality, args.dl_mae
-        )
+        dl_bundle = load_bundle_from_csv(args.dl_csv, args.dl_modality, args.dl_mae)
         fused = fuse_intra_modality(
-            cls_bundle, dl_bundle,
+            cls_bundle,
+            dl_bundle,
             modality_name=args.modality,
             min_weight=args.min_weight,
         )
@@ -111,6 +113,7 @@ def _print_summary(bundle: PredictionBundle, out_dir: str) -> None:
     print(f"Mean σ       : {bundle.sigma.mean():.4f} mm")
     if bundle.y_true is not None:
         import numpy as np
+
         mae = float(np.mean(np.abs(bundle.y_pred - bundle.y_true)))
         print(f"Holdout MAE  : {mae:.4f} mm  (vs ground truth)")
     print(f"Saved to     : {out_dir}/")

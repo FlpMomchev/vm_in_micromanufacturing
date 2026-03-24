@@ -28,9 +28,13 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.ensemble import ExtraTreesRegressor, HistGradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+)
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -40,18 +44,21 @@ from sklearn.preprocessing import StandardScaler
 
 try:
     from xgboost import XGBRegressor
+
     _HAS_XGB = True
 except ImportError:
     _HAS_XGB = False
 
 try:
     from lightgbm import LGBMRegressor
+
     _HAS_LGB = True
 except ImportError:
     _HAS_LGB = False
 
 try:
     from catboost import CatBoostRegressor
+
     _HAS_CAT = True
 except ImportError:
     _HAS_CAT = False
@@ -61,89 +68,143 @@ from ..utils import get_logger
 logger = get_logger(__name__)
 
 _META_COLS = {
-    "modality", "record_name", "recording_root", "depth_mm",
-    "step_idx", "duration_s", "sr_hz", "sr_hz_native", "sr_hz_used",
-    "ds_rate", "file_path", "run_id", "batch_id",
+    "modality",
+    "record_name",
+    "recording_root",
+    "depth_mm",
+    "step_idx",
+    "duration_s",
+    "sr_hz",
+    "sr_hz_native",
+    "sr_hz_used",
+    "ds_rate",
+    "file_path",
+    "run_id",
+    "batch_id",
     "exclude_from_dl_training",  # manifest flag
 }
 TARGET_COL = "depth_mm"
-GROUP_COL  = "recording_root"
+GROUP_COL = "recording_root"
 
 
 def _regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     return {
-        "mae":  float(mean_absolute_error(y_true, y_pred)),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
         "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "r2":   float(r2_score(y_true, y_pred)),
-        "mean_signed_error": float(np.mean(y_pred - y_true))
+        "r2": float(r2_score(y_true, y_pred)),
+        "mean_signed_error": float(np.mean(y_pred - y_true)),
     }
 
 
 def _build_models(skip_slow: bool = False) -> dict[str, Any]:
     """Return a dict of model_name → sklearn-compatible estimator."""
     models: dict[str, Any] = {
-        "RandomForest": Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1))
-        ]),
-        "ExtraTrees": Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", ExtraTreesRegressor(n_estimators=300, random_state=42, n_jobs=-1))
-        ]),
-        "HistGBT": Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", HistGradientBoostingRegressor(max_iter=500, random_state=42))
-        ]),
-        "Ridge": Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", Ridge(alpha=1.0))
-        ]),
-        "ElasticNet": Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", ElasticNet(max_iter=5000, random_state=42))
-        ]),
-        "GPR": Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", GaussianProcessRegressor(
-                kernel=ConstantKernel(1.0) * RBF(1.0) + WhiteKernel(0.1),
-                n_restarts_optimizer=3, random_state=42
-            ))
-        ])
+        "RandomForest": Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                ("mdl", RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)),
+            ]
+        ),
+        "ExtraTrees": Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                ("mdl", ExtraTreesRegressor(n_estimators=300, random_state=42, n_jobs=-1)),
+            ]
+        ),
+        "HistGBT": Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                ("mdl", HistGradientBoostingRegressor(max_iter=500, random_state=42)),
+            ]
+        ),
+        "Ridge": Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                ("mdl", Ridge(alpha=1.0)),
+            ]
+        ),
+        "ElasticNet": Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                ("mdl", ElasticNet(max_iter=5000, random_state=42)),
+            ]
+        ),
+        "GPR": Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                (
+                    "mdl",
+                    GaussianProcessRegressor(
+                        kernel=ConstantKernel(1.0) * RBF(1.0) + WhiteKernel(0.1),
+                        n_restarts_optimizer=3,
+                        random_state=42,
+                    ),
+                ),
+            ]
+        ),
     }
 
     if _HAS_XGB:
-        models["XGBoost"] = Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", XGBRegressor(
-                n_estimators=500, learning_rate=0.05, tree_method="hist",
-                device="cpu", n_jobs=1, random_state=42, verbosity=0
-            ))
-        ])
+        models["XGBoost"] = Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                (
+                    "mdl",
+                    XGBRegressor(
+                        n_estimators=500,
+                        learning_rate=0.05,
+                        tree_method="hist",
+                        device="cpu",
+                        n_jobs=1,
+                        random_state=42,
+                        verbosity=0,
+                    ),
+                ),
+            ]
+        )
     if _HAS_LGB:
-        models["LightGBM"] = Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", LGBMRegressor(
-                n_estimators=500, learning_rate=0.05,
-                device="cpu", n_jobs=1, random_state=42, verbose=-1
-            )),
-        ])
+        models["LightGBM"] = Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                (
+                    "mdl",
+                    LGBMRegressor(
+                        n_estimators=500,
+                        learning_rate=0.05,
+                        device="cpu",
+                        n_jobs=1,
+                        random_state=42,
+                        verbose=-1,
+                    ),
+                ),
+            ]
+        )
     if _HAS_CAT:
-        models["CatBoost"] = Pipeline([
-            ("imp", SimpleImputer(strategy="median")),
-            ("scl", StandardScaler()),
-            ("mdl", CatBoostRegressor(
-                iterations=500, learning_rate=0.05, task_type="CPU",
-                random_seed=42, verbose=0, eval_metric="MAE"
-            ))
-        ])
+        models["CatBoost"] = Pipeline(
+            [
+                ("imp", SimpleImputer(strategy="median")),
+                ("scl", StandardScaler()),
+                (
+                    "mdl",
+                    CatBoostRegressor(
+                        iterations=500,
+                        learning_rate=0.05,
+                        task_type="CPU",
+                        random_seed=42,
+                        verbose=0,
+                        eval_metric="MAE",
+                    ),
+                ),
+            ]
+        )
 
     return models
 
@@ -161,7 +222,7 @@ def train_classical(
     train_fraction: float = 0.70,
     n_cv_folds: int = 5,
     skip_slow_models: bool = False,
-    seed: int = 42
+    seed: int = 42,
 ) -> dict[str, Any]:
     """Train all classical ML models with grouped holdout + nested CV.
 
@@ -192,21 +253,26 @@ def train_classical(
     if holdout_runs:
         mask_ho = df[GROUP_COL].isin(holdout_runs)
         df_holdout = df[mask_ho].copy()
-        df_train   = df[~mask_ho].copy()
-        logger.info("Holdout: %d rows (%s). Train pool: %d rows.", len(df_holdout), holdout_runs, len(df_train))
+        df_train = df[~mask_ho].copy()
+        logger.info(
+            "Holdout: %d rows (%s). Train pool: %d rows.",
+            len(df_holdout),
+            holdout_runs,
+            len(df_train),
+        )
     else:
         gss = GroupShuffleSplit(n_splits=1, test_size=1 - train_fraction, random_state=seed)
         train_idx, hold_idx = next(gss.split(df, groups=df[GROUP_COL]))
-        df_train   = df.iloc[train_idx].copy()
+        df_train = df.iloc[train_idx].copy()
         df_holdout = df.iloc[hold_idx].copy()
 
     df_train.to_csv(out_dir / "fixed_grouped_split_assignment.csv", index=False)
 
     X_train = df_train[feat_cols].to_numpy()
     y_train = df_train[TARGET_COL].to_numpy(dtype=np.float64)
-    groups  = df_train[GROUP_COL].to_numpy()
-    X_hold  = df_holdout[feat_cols].to_numpy()
-    y_hold  = df_holdout[TARGET_COL].to_numpy(dtype=np.float64)
+    groups = df_train[GROUP_COL].to_numpy()
+    X_hold = df_holdout[feat_cols].to_numpy()
+    y_hold = df_holdout[TARGET_COL].to_numpy(dtype=np.float64)
 
     models = _build_models(skip_slow=skip_slow_models)
 
@@ -255,9 +321,9 @@ def train_classical(
 
     fold_preds_arr = np.stack(fold_preds, axis=1)  # (n_hold, n_folds)
     sigma_pred = float(np.std(fold_preds_arr, axis=1).mean())
-    residuals  = hold_pred - y_hold
-    sigma_mae  = float(np.std(residuals))
-    total_uncertainty = float(np.sqrt(sigma_pred ** 2 + sigma_mae ** 2))
+    residuals = hold_pred - y_hold
+    sigma_mae = float(np.std(residuals))
+    total_uncertainty = float(np.sqrt(sigma_pred**2 + sigma_mae**2))
 
     # Persist artefacts
     bundle = {
@@ -268,22 +334,22 @@ def train_classical(
         "sigma_pred": sigma_pred,
         "sigma_mae": sigma_mae,
         "total_uncertainty": total_uncertainty,
-        "modality": "airborne_classical"  # overridden by caller for structure
+        "modality": "airborne_classical",  # overridden by caller for structure
     }
     joblib.dump(bundle, final_dir / "best_model_bundle.joblib")
 
     metadata = {
-        "best_model_name":   best_model_name,
-        "features_csv":      str(features_csv),
-        "n_features":        len(feat_cols),
-        "n_train":           int(len(y_train)),
-        "n_holdout":         int(len(y_hold)),
-        "holdout_runs":      holdout_runs or [],
-        "holdout_metrics":   hold_metrics,
-        "sigma_pred":        sigma_pred,
-        "sigma_mae":         sigma_mae,
+        "best_model_name": best_model_name,
+        "features_csv": str(features_csv),
+        "n_features": len(feat_cols),
+        "n_train": int(len(y_train)),
+        "n_holdout": int(len(y_hold)),
+        "holdout_runs": holdout_runs or [],
+        "holdout_metrics": hold_metrics,
+        "sigma_pred": sigma_pred,
+        "sigma_mae": sigma_mae,
         "total_uncertainty": total_uncertainty,
-        "cv_mean_mae":       float(repeat_summary.loc[best_model_name, "mean"])
+        "cv_mean_mae": float(repeat_summary.loc[best_model_name, "mean"]),
     }
     with open(final_dir / "best_model_metadata.json", "w") as fh:
         json.dump(metadata, fh, indent=2)
@@ -296,12 +362,12 @@ def train_classical(
 
     logger.info("Artefacts saved to %s", final_dir)
     return {
-        "best_model_name":   best_model_name,
-        "holdout_metrics":   hold_metrics,
+        "best_model_name": best_model_name,
+        "holdout_metrics": hold_metrics,
         "repeat_metrics_df": repeat_df,
-        "out_dir":           str(out_dir),
-        "bundle_path":       str(final_dir / "best_model_bundle.joblib"),
-        "total_uncertainty": total_uncertainty
+        "out_dir": str(out_dir),
+        "bundle_path": str(final_dir / "best_model_bundle.joblib"),
+        "total_uncertainty": total_uncertainty,
     }
 
 

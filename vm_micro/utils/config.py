@@ -89,6 +89,7 @@ def apply_overrides(cfg: dict[str, Any], overrides: list[str]) -> dict[str, Any]
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _parse_scalar(s: str) -> Any:
     """Parse a CLI value string into the most specific Python type."""
     if s.lower() in {"true", "yes"}:

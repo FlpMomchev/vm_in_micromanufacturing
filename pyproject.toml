@@ -73,7 +73,16 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",   # line too long — feature name strings are intentionally long
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+
+[tool.ruff.lint.per-file-ignores]
+# Scripts do sys.path manipulation before imports — E402 is unavoidable there
+"scripts/*.py" = ["E402"]
+# Notebooks have inter-cell variable references ruff cannot follow across cells
+"notebooks/**/*.ipynb" = ["F821", "F841", "F811", "E741", "E501", "E402"]

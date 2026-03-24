@@ -27,34 +27,35 @@ import pandas as pd
 import soundfile as sf
 from scipy import signal
 
-from .io import get_input_kind, read_signal_auto
-from .manifest import (
-    build_segment_filename,
-    load_doe,
-    load_expected_map_csv,
-    map_segments_to_doe
-)
-
+from .io import read_signal_auto
+from .manifest import build_segment_filename, map_segments_to_doe
+from .plots import save_debug_plots
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Envelope helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def band_envelope_db(
     y: np.ndarray,
     sr: int,
     band_hz: tuple[float, float] = (2000.0, 5000.0),
     win_ms: float = 21.0,
-    hop_ms: float = 5.0
+    hop_ms: float = 5.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (times, envelope_dB) for the specified frequency band."""
-    nperseg  = max(256, int(sr * win_ms / 1000.0))
+    nperseg = max(256, int(sr * win_ms / 1000.0))
     noverlap = min(int(nperseg - max(1, int(sr * hop_ms / 1000.0))), nperseg - 1)
 
     f, t, Zxx = signal.stft(
-        y, fs=sr, window="hann",
-        nperseg=nperseg, noverlap=noverlap,
-        detrend=False, boundary=None, padded=False
+        y,
+        fs=sr,
+        window="hann",
+        nperseg=nperseg,
+        noverlap=noverlap,
+        detrend=False,
+        boundary=None,
+        padded=False,
     )
     P = (np.abs(Zxx) ** 2).astype(np.float64)
     lo, hi = band_hz
@@ -99,6 +100,7 @@ def _asymmetric_baseline(b_raw: np.ndarray, win: int) -> np.ndarray:
 # State machine
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _state_machine(
     delta_db: np.ndarray,
     times: np.ndarray,
@@ -111,7 +113,7 @@ def _state_machine(
     if not len(delta_db):
         return []
     dt = float(np.median(np.diff(times))) if len(times) > 1 else 0.01
-    on_frames  = max(1, int(round(min_on_s  / dt)))
+    on_frames = max(1, int(round(min_on_s / dt)))
     off_frames = max(1, int(round(min_off_s / dt)))
 
     IDLE, ACTIVE = 0, 1
@@ -152,6 +154,7 @@ def _state_machine(
 # Post-processing helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _seg_duration(times: np.ndarray, seg: tuple[int, int]) -> float:
     return float(times[seg[1]] - times[seg[0]])
 
@@ -185,7 +188,7 @@ def _split_at_valley(
     if float(d[valley_rel]) >= thr_off:
         return [seg]
     cut = a + valley_rel
-    left  = (a, max(a, cut))
+    left = (a, max(a, cut))
     right = (min(b, cut + 1), b)
     if left[1] - left[0] < 3 or right[1] - right[0] < 3:
         return [seg]
@@ -244,10 +247,10 @@ def _refine_to_expected(
     segs = list(segs)
 
     if len(segs) > expected_n:
-        durations  = np.array([_seg_duration(times, s)  for s in segs], dtype=float)
-        strengths  = np.array([_seg_strength(delta_db, s) for s in segs], dtype=float)
+        durations = np.array([_seg_duration(times, s) for s in segs], dtype=float)
+        strengths = np.array([_seg_strength(delta_db, s) for s in segs], dtype=float)
         score = durations + 0.15 * (strengths - np.median(strengths))
-        keep  = np.ones(len(segs), dtype=bool)
+        keep = np.ones(len(segs), dtype=bool)
         for idx in np.argsort(score):
             if keep.sum() <= expected_n:
                 break
@@ -255,10 +258,10 @@ def _refine_to_expected(
         segs = [s for k, s in zip(keep, segs) if k]
 
     if len(segs) < expected_n and segs:
-        typical     = float(np.median([_seg_duration(times, s) for s in segs]))
-        typical     = typical if np.isfinite(typical) and typical > 0 else 0.5
+        typical = float(np.median([_seg_duration(times, s) for s in segs]))
+        typical = typical if np.isfinite(typical) and typical > 0 else 0.5
         min_valley_s = max(0.10, 0.25 * typical)
-        thr_off      = float(np.percentile(delta_db, 35))
+        thr_off = float(np.percentile(delta_db, 35))
 
         changed = True
         while changed and len(segs) < expected_n:
@@ -281,6 +284,7 @@ def _refine_to_expected(
 # Main detection
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def detect_segments(
     y: np.ndarray,
     sr: int,
@@ -291,11 +295,11 @@ def detect_segments(
     smooth_win_s: float | None = None,
     baseline_q: float = 0.10,
     baseline_win_s: float | None = None,
-    min_on_frac: float  = 0.08,
+    min_on_frac: float = 0.08,
     min_off_frac: float = 0.08,
-    merge_gap_frac: float   = 0.05,
-    min_valley_frac: float  = 0.20,
-    min_keep_frac: float    = 0.10
+    merge_gap_frac: float = 0.05,
+    min_valley_frac: float = 0.20,
+    min_keep_frac: float = 0.10,
 ) -> tuple[list[tuple[float, float]], dict[str, Any]]:
     """Detect drilling segments using baseline-relative IDLE/ACTIVE machine.
 
@@ -325,17 +329,17 @@ def detect_segments(
     base_win = max(5, int(round(baseline_win_s / dt)))
     baseline = _asymmetric_baseline(_rolling_quantile(env_s, baseline_q, base_win), base_win)
 
-    delta   = env_s - baseline
+    delta = env_s - baseline
     d_valid = delta[valid]
 
-    iqr     = float(np.subtract(*np.percentile(d_valid, [75, 25])) + 1e-6)
+    iqr = float(np.subtract(*np.percentile(d_valid, [75, 25])) + 1e-6)
     hyst_db = max(0.8, 0.20 * iqr)
 
-    min_on_s     = max(0.03, min_on_frac     * typical_s)
-    min_off_s    = max(0.03, min_off_frac    * typical_s)
-    merge_gap_s  = max(0.02, merge_gap_frac  * typical_s)
+    min_on_s = max(0.03, min_on_frac * typical_s)
+    min_off_s = max(0.03, min_off_frac * typical_s)
+    merge_gap_s = max(0.02, merge_gap_frac * typical_s)
     min_valley_s = max(0.08, min_valley_frac * typical_s)
-    min_keep_s   = max(0.08, min_keep_frac   * typical_s)
+    min_keep_s = max(0.08, min_keep_frac * typical_s)
 
     thr_lo = float(np.percentile(d_valid, 2))
     thr_hi = float(np.percentile(d_valid, 99.7))
@@ -343,7 +347,7 @@ def detect_segments(
     best: tuple[int, float, float, list] | None = None
 
     for _ in range(32):
-        thr_on  = 0.5 * (thr_lo + thr_hi)
+        thr_on = 0.5 * (thr_lo + thr_hi)
         thr_off = thr_on - hyst_db
 
         segs = _state_machine(delta, times, thr_on, thr_off, min_on_s, min_off_s)
@@ -369,11 +373,21 @@ def detect_segments(
     segs_s = [(float(times[a]), float(times[b])) for a, b in segs]
 
     dbg: dict[str, Any] = dict(
-        times=times, env_db=env_db, env_s=env_s, baseline=baseline, delta=delta,
-        thr_on=thr_on, thr_off=thr_off, typical_s=typical_s,
-        smooth_win_s=smooth_win_s, baseline_win_s=baseline_win_s,
-        min_on_s=min_on_s, min_off_s=min_off_s,
-        merge_gap_s=merge_gap_s, min_valley_s=min_valley_s, min_keep_s=min_keep_s
+        times=times,
+        env_db=env_db,
+        env_s=env_s,
+        baseline=baseline,
+        delta=delta,
+        thr_on=thr_on,
+        thr_off=thr_off,
+        typical_s=typical_s,
+        smooth_win_s=smooth_win_s,
+        baseline_win_s=baseline_win_s,
+        min_on_s=min_on_s,
+        min_off_s=min_off_s,
+        merge_gap_s=merge_gap_s,
+        min_valley_s=min_valley_s,
+        min_keep_s=min_keep_s,
     )
     return segs_s, dbg
 
@@ -385,21 +399,21 @@ def refine_segment_edges(
     lookahead_s: float = 0.25,
     on_ratio: float = 0.50,
     off_ratio: float = 1.00,
-    snap_min_window_s: float = 0.08
+    snap_min_window_s: float = 0.08,
 ) -> list[tuple[float, float]]:
     """Adjust segment edges using a relaxed threshold within limited windows."""
-    t    = np.asarray(dbg["times"])
-    env  = np.asarray(dbg["env_s"])
+    t = np.asarray(dbg["times"])
+    env = np.asarray(dbg["env_s"])
     base = np.asarray(dbg["baseline"])
-    thr_on  = float(dbg["thr_on"])
+    thr_on = float(dbg["thr_on"])
     thr_off = float(dbg["thr_off"])
-    dt   = float(np.median(np.diff(t)))
-    n    = len(t)
-    lb   = int(round(lookback_s / dt))
-    la   = int(round(lookahead_s / dt))
+    dt = float(np.median(np.diff(t)))
+    n = len(t)
+    lb = int(round(lookback_s / dt))
+    la = int(round(lookahead_s / dt))
     snap = int(round(snap_min_window_s / dt))
 
-    thr_low_on  = base + max(0.2, thr_on  * on_ratio)
+    thr_low_on = base + max(0.2, thr_on * on_ratio)
     thr_low_off = base + max(0.2, thr_off * off_ratio)
 
     def sec_to_idx(x: float) -> int:
@@ -434,10 +448,7 @@ def refine_segment_edges(
 
 
 def apply_padding(
-    segs_s: list[tuple[float, float]],
-    pre_pad_s: float,
-    post_pad_s: float,
-    duration_s: float
+    segs_s: list[tuple[float, float]], pre_pad_s: float, post_pad_s: float, duration_s: float
 ) -> list[tuple[float, float]]:
     out = []
     for a, b in segs_s:
@@ -452,9 +463,8 @@ def apply_padding(
 # Export
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _seg_to_samples(
-    a: float, b: float, sr: int, n_samples: int
-) -> tuple[int, int]:
+
+def _seg_to_samples(a: float, b: float, sr: int, n_samples: int) -> tuple[int, int]:
     s0 = max(0, min(n_samples, int(round(a * sr))))
     s1 = max(0, min(n_samples, int(round(b * sr))))
     return s0, s1
@@ -477,7 +487,7 @@ def _write_h5_segment(
     time_vector: np.ndarray,
     data_key: str,
     time_key: str,
-    attrs: dict[str, Any] | None
+    attrs: dict[str, Any] | None,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     group, dname = data_key.rsplit("/", 1)
@@ -505,7 +515,7 @@ def export_segments(
     input_kind: str,
     time_vector: np.ndarray | None = None,
     h5_data_key: str = "measurement/data",
-    h5_time_key: str = "measurement/time_vector"
+    h5_time_key: str = "measurement/time_vector",
 ) -> list[Path]:
     """Write one file per segment; return output paths."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -527,13 +537,23 @@ def export_segments(
         elif fmt == "h5":
             tv = tv_full[s0:s1] if tv_full is not None else _make_time_vector(len(chunk), sr, a)
             _write_h5_segment(
-                p, chunk, tv, h5_data_key, h5_time_key,
-                attrs={"sample_rate_hz": int(sr), "segment_start_s": a, "segment_end_s": b}
+                p,
+                chunk,
+                tv,
+                h5_data_key,
+                h5_time_key,
+                attrs={"sample_rate_hz": int(sr), "segment_start_s": a, "segment_end_s": b},
             )
         elif fmt == "npz":
             tv = tv_full[s0:s1] if tv_full is not None else _make_time_vector(len(chunk), sr, a)
-            np.savez(p, data=chunk, time_vector=tv, sample_rate_hz=int(sr),
-                     segment_start_s=a, segment_end_s=b)
+            np.savez(
+                p,
+                data=chunk,
+                time_vector=tv,
+                sample_rate_hz=int(sr),
+                segment_start_s=a,
+                segment_end_s=b,
+            )
         out_paths.append(p)
 
     return out_paths
@@ -559,6 +579,7 @@ def _fmt_ext(export_format: str, input_kind: str) -> str:
 # High-level: process one file
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def process_one_file(
     audio_path: Path,
     doe_df: pd.DataFrame,
@@ -575,36 +596,60 @@ def process_one_file(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Split one recording, map to DOE, export segments, return manifest rows."""
     audio_path = Path(audio_path)
-    stem       = audio_path.stem
-    out_dir    = out_root / stem
+    stem = audio_path.stem
+    out_dir = out_root / stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
     sig = read_signal_auto(
-        audio_path, target_sr=target_sr,
-        h5_data_key=h5_data_key, h5_time_key=h5_time_key,
+        audio_path,
+        target_sr=target_sr,
+        h5_data_key=h5_data_key,
+        h5_time_key=h5_time_key,
     )
     y, sr, duration_s = sig["y"], int(sig["sr"]), float(sig["duration_s"])
     tv, kind = sig["time_vector"], str(sig["input_kind"])
 
-    segs_s, dbg     = detect_segments(y, sr, segments_per_file=expected_segments, band_hz=band_hz)
-    segs_padded     = apply_padding(segs_s, pre_pad_s, post_pad_s, duration_s)
-    segs_final      = refine_segment_edges(dbg, segs_padded)
+    segs_s, dbg = detect_segments(y, sr, segments_per_file=expected_segments, band_hz=band_hz)
+    segs_padded = apply_padding(segs_s, pre_pad_s, post_pad_s, duration_s)
+    segs_final = refine_segment_edges(dbg, segs_padded)
+
+    # ── debug plots ───────────────────────────────────────────────────────────
+    p_core, p_pad = save_debug_plots(
+        dbg,
+        segs_s,
+        segs_padded,
+        segs_final,
+        out_dir=out_dir,
+        stem=stem,
+    )
 
     doe_mapped = map_segments_to_doe(doe_df, n_segments=len(segs_final))
-    ext        = _fmt_ext(export_format, kind)
+    ext = _fmt_ext(export_format, kind)
 
     filenames: list[str] = []
     for i, row in doe_mapped.iterrows():
-        filenames.append(build_segment_filename(
-            stem, int(i) + 1,
-            step=row.get("Step"), hole=row.get("HoleID"), depth=row.get("Depth_mm"),
-            ext=ext,
-        ))
+        filenames.append(
+            build_segment_filename(
+                stem,
+                int(i) + 1,
+                step=row.get("Step"),
+                hole=row.get("HoleID"),
+                depth=row.get("Depth_mm"),
+                ext=ext,
+            )
+        )
 
     out_paths = export_segments(
-        y, sr, segs_final, out_dir, filenames,
-        export_format=export_format, input_kind=kind, time_vector=tv,
-        h5_data_key=h5_data_key, h5_time_key=h5_time_key,
+        y,
+        sr,
+        segs_final,
+        out_dir,
+        filenames,
+        export_format=export_format,
+        input_kind=kind,
+        time_vector=tv,
+        h5_data_key=h5_data_key,
+        h5_time_key=h5_time_key,
     )
 
     rows: list[dict[str, Any]] = []
@@ -613,30 +658,45 @@ def process_one_file(
     ):
         s0, s1 = _seg_to_samples(fin[0], fin[1], sr, len(y))
         row = doe_mapped.iloc[i - 1].to_dict()
-        rows.append({
-            "input_file": str(audio_path), "input_stem": stem,
-            "input_kind": kind, "export_format": _resolve_fmt(export_format, kind),
-            "sr_hz": int(sr), "duration_s": float(duration_s),
-            "expected_segments": int(expected_segments),
-            "detected_segments_core": int(len(segs_s)),
-            "exported_segments_final": int(len(segs_final)),
-            "split_index": int(i),
-            "core_start_s": float(core[0]),  "core_end_s": float(core[1]),
-            "padded_start_s": float(pad[0]), "padded_end_s": float(pad[1]),
-            "start_s": float(fin[0]),        "end_s": float(fin[1]),
-            "duration_seg_s": float(fin[1] - fin[0]),
-            "start_sample": int(s0),         "end_sample": int(s1),
-            "time_jitter_rel": float(sig.get("relative_time_jitter", 0.0)),
-            "output_path": str(p.relative_to(out_root)),
-            **row
-        })
+        rows.append(
+            {
+                "input_file": str(audio_path),
+                "input_stem": stem,
+                "input_kind": kind,
+                "export_format": _resolve_fmt(export_format, kind),
+                "sr_hz": int(sr),
+                "duration_s": float(duration_s),
+                "expected_segments": int(expected_segments),
+                "detected_segments_core": int(len(segs_s)),
+                "exported_segments_final": int(len(segs_final)),
+                "split_index": int(i),
+                "core_start_s": float(core[0]),
+                "core_end_s": float(core[1]),
+                "padded_start_s": float(pad[0]),
+                "padded_end_s": float(pad[1]),
+                "start_s": float(fin[0]),
+                "end_s": float(fin[1]),
+                "duration_seg_s": float(fin[1] - fin[0]),
+                "start_sample": int(s0),
+                "end_sample": int(s1),
+                "time_jitter_rel": float(sig.get("relative_time_jitter", 0.0)),
+                "output_path": str(p.relative_to(out_root)),
+                "debug_plot_core": str(p_core.relative_to(out_root)),
+                "debug_plot_padded": str(p_pad.relative_to(out_root)),
+                **row,
+            }
+        )
 
     return pd.DataFrame(rows), {
-        "stem": stem, "input_kind": kind, "sr_hz": int(sr),
+        "stem": stem,
+        "input_kind": kind,
+        "sr_hz": int(sr),
         "expected_segments": int(expected_segments),
         "detected_segments_core": int(len(segs_s)),
         "exported_segments_final": int(len(segs_final)),
-        "out_dir": str(out_dir)
+        "out_dir": str(out_dir),
+        "debug_core": str(p_core),
+        "debug_padded": str(p_pad),
     }
 
 
@@ -652,7 +712,7 @@ def process_batch(
     export_format: str = "auto",
     h5_data_key: str = "measurement/data",
     h5_time_key: str = "measurement/time_vector",
-    target_sr: int | None = None
+    target_sr: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Batch-process a list of recordings; write manifest.csv; return (manifest, summary)."""
     out_root.mkdir(parents=True, exist_ok=True)
@@ -668,10 +728,16 @@ def process_batch(
                 "Add it to the expected_map or provide an expected-map CSV."
             )
         m_df, summary = process_one_file(
-            p, doe_df, out_root, expected_map[stem],
-            pre_pad_s=pre_pad_s, post_pad_s=post_pad_s, band_hz=band_hz,
+            p,
+            doe_df,
+            out_root,
+            expected_map[stem],
+            pre_pad_s=pre_pad_s,
+            post_pad_s=post_pad_s,
+            band_hz=band_hz,
             export_format=export_format,
-            h5_data_key=h5_data_key, h5_time_key=h5_time_key,
+            h5_data_key=h5_data_key,
+            h5_time_key=h5_time_key,
             target_sr=target_sr,
         )
         all_rows.append(m_df)

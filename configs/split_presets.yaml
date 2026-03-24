@@ -1,0 +1,122 @@
+# configs/split_presets.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch splitting presets for vm-split batch --preset <name>
+#
+# All paths are relative to the project root.
+# band_hz: [low, high] in Hz — detection band for the IDLE/ACTIVE state machine.
+# expected_map: stem → expected number of segments per recording.
+# ─────────────────────────────────────────────────────────────────────────────
+
+airborne_normalBand:
+  doe_xlsx:    "docs/doe/Design_of_Experiment.xlsx"
+  doe_sheet:   "DOE_run_order"
+  input_dir:   "raw_data/air_borne/normalBand"
+  input_glob:  "*.flac"
+  out_root:    "all_outputs/air"
+  pre_pad_s:   0.20
+  post_pad_s:  0.25
+  band_hz:     [2000.0, 5000.0]
+  expected_map:
+    0303_1_4422:    45
+    0303_2_2_1842:  49
+    0303_3_2_8119:  49
+    0503_1_2_4532:  49
+    0503_2_1_5344:  49
+    0503_3_1_0862:  49
+    0503_2_2_3013:  49
+    0503_5_1_8978:  49
+    0503_4_2_5776:  49
+    0503_5_2_5965:  49
+    0503_6_1_6360:  49
+    0503_7_1_8588:  49
+    0503_7_2_9976:  49
+    0503_8_1_5957:  49
+    0503_8_2_5729:  49
+    0503_9_1_1285:  49
+    0503_9_2_2739:  49
+    0503_10_1_7304: 49
+    0503_10_2_7913: 49
+    0503_11_1_2786: 49
+    0503_12_1_6520: 49
+    0503_11_2_2159: 49
+    0503_12_2_8250: 49
+    0503_13_1_1188: 49
+    0503_13_2_5115: 49
+    0503_14_1_1553: 49
+    0503_14_2_7317: 49
+    0503_6_2_3712:  49
+
+airborne_largerBand:
+  doe_xlsx:    "docs/doe/Design_of_Experiment.xlsx"
+  doe_sheet:   "DOE_run_order"
+  input_dir:   "raw_data/air_borne/largerBand"
+  input_glob:  "*.flac"
+  out_root:    "all_outputs/air"
+  pre_pad_s:   0.20
+  post_pad_s:  0.25
+  band_hz:     [100.0, 5000.0]
+  expected_map:
+    0303_3_1_8881: 49
+    0503_3_2_8200: 49
+
+airborne_7353:
+  doe_xlsx:    "docs/doe/Design_of_Experiment_7353.xlsx"
+  doe_sheet:   "DOE_run_order"
+  input_dir:   "raw_data/air_borne/audio_splits_final_normalBand_only_0503_4_1_7353"
+  input_glob:  "*.flac"
+  out_root:    "all_outputs/air"
+  pre_pad_s:   0.20
+  post_pad_s:  0.25
+  band_hz:     [2000.0, 5000.0]
+  expected_map:
+    0503_4_1_7353: 35
+
+structure:
+  doe_xlsx:    "docs/doe/Design_of_Experiment.xlsx"
+  doe_sheet:   "DOE_run_order"
+  input_dir:   "raw_data/structure_borne"
+  input_glob:  "*.h5"
+  out_root:    "all_outputs/structure"
+  pre_pad_s:   0.05
+  post_pad_s:  0.05
+  band_hz:     [3500.0, 5000.0]
+  expected_map:
+    "16": 49
+    "17": 49
+    "18": 49
+    "19": 49
+    "20": 49
+    "22": 49
+    "23": 47
+    "24": 49
+    "25": 49
+    "26": 49
+    "27": 49
+    "28": 49
+    "29": 49
+    "30": 49
+    "31": 49
+    "32": 49
+    "33": 49
+    "34": 49
+    "35": 49
+    "36": 49
+    "37": 49
+    "38": 49
+    "39": 49
+    "40": 49
+    "41": 49
+    "42": 49
+    "43": 49
+
+structure_21:
+  doe_xlsx:    "docs/doe/Design_of_Experiment_7353.xlsx"
+  doe_sheet:   "DOE_run_order"
+  input_dir:   "raw_data/structure_borne/21_"
+  input_glob:  "*.h5"
+  out_root:    "all_outputs/structure"
+  pre_pad_s:   0.05
+  post_pad_s:  0.05
+  band_hz:     [3500.0, 5000.0]
+  expected_map:
+    "21_": 35

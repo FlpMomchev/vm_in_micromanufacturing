@@ -35,31 +35,32 @@ logger = get_logger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="vm-infer",
-                                description="Run depth prediction inference.")
+    p = argparse.ArgumentParser(prog="vm-infer", description="Run depth prediction inference.")
     sub = p.add_subparsers(dest="mode", required=True)
 
     # ── classical ─────────────────────────────────────────────────────────────
     cp = sub.add_parser("classical", help="Classical ML inference.")
-    cp.add_argument("--bundle",   required=True,
-                    help="Path to best_model_bundle.joblib.")
-    cp.add_argument("--features", required=True,
-                    help="Feature CSV (must contain same columns as training).")
-    cp.add_argument("--out-csv",  default=None)
+    cp.add_argument("--bundle", required=True, help="Path to best_model_bundle.joblib.")
+    cp.add_argument(
+        "--features", required=True, help="Feature CSV (must contain same columns as training)."
+    )
+    cp.add_argument("--out-csv", default=None)
 
     # ── DL ────────────────────────────────────────────────────────────────────
     dp = sub.add_parser("dl", help="DL model inference.")
-    dp.add_argument("--model-dir",  required=True,
-                    help="Training output dir or final_model dir.")
-    dp.add_argument("--data-dir",   required=True,
-                    help="Directory of audio files to run inference on.")
-    dp.add_argument("--file-glob",  default="**/*.flac")
-    dp.add_argument("--out-csv",    default=None)
-    dp.add_argument("--task",       default=None,
-                    choices=["classification", "regression"],
-                    help="Override task from config.")
-    dp.add_argument("--device",     default="auto",
-                    choices=["auto", "cpu", "cuda"])
+    dp.add_argument("--model-dir", required=True, help="Training output dir or final_model dir.")
+    dp.add_argument(
+        "--data-dir", required=True, help="Directory of audio files to run inference on."
+    )
+    dp.add_argument("--file-glob", default="**/*.flac")
+    dp.add_argument("--out-csv", default=None)
+    dp.add_argument(
+        "--task",
+        default=None,
+        choices=["classification", "regression"],
+        help="Override task from config.",
+    )
+    dp.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     dp.add_argument("--batch-size", type=int, default=None)
 
     return p
@@ -73,6 +74,7 @@ def _infer_classical(args: argparse.Namespace) -> None:
     print(f"Predictions: {len(df)} rows → {out_csv}")
     if "depth_mm" in df.columns:
         import numpy as np
+
         mae = float(np.mean(np.abs(df["y_pred"] - df["depth_mm"])))
         print(f"MAE vs ground truth: {mae:.4f} mm")
 
@@ -83,10 +85,12 @@ def _infer_dl(args: argparse.Namespace) -> None:
     from vm_micro.dl.engine import aggregate_file_predictions, make_loader, predict_loader
     from vm_micro.dl.models import DepthModel
     from vm_micro.dl.utils import (
-        add_class_labels, attach_step_idx_if_possible,
-        build_file_table, choose_device, read_label_mapping,
+        add_class_labels,
+        attach_step_idx_if_possible,
+        build_file_table,
+        choose_device,
+        read_label_mapping,
     )
-    import pandas as pd
 
     model_dir = Path(args.model_dir)
     # Resolve final_model subfolder
@@ -104,7 +108,7 @@ def _infer_dl(args: argparse.Namespace) -> None:
         cfg.task = args.task
     if args.batch_size:
         cfg.batch_size = args.batch_size
-    cfg.data_dir  = args.data_dir
+    cfg.data_dir = args.data_dir
     cfg.file_glob = args.file_glob
 
     device = choose_device(args.device if args.device != "auto" else cfg.device)
@@ -127,7 +131,7 @@ def _infer_dl(args: argparse.Namespace) -> None:
     model.load_state_dict(state)
     model.eval()
 
-    ds     = WaveformWindowDataset(file_df, cfg, training=False)
+    ds = WaveformWindowDataset(file_df, cfg, training=False)
     loader = make_loader(ds, cfg, shuffle=False)
 
     window_df = predict_loader(model, loader, device, cfg)
@@ -139,6 +143,7 @@ def _infer_dl(args: argparse.Namespace) -> None:
 
     if "y_true_depth" in file_pred.columns:
         import numpy as np
+
         mae = float(np.mean(np.abs(file_pred["y_pred_depth"] - file_pred["y_true_depth"])))
         print(f"MAE vs ground truth: {mae:.4f} mm")
 

@@ -30,7 +30,7 @@ To swap out the fusion strategy later, only this file needs to change.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -57,32 +57,35 @@ class PredictionBundle:
     class_probs     : Optional (N, C) probability matrix (classification).
     metadata        : Free-form dict for diagnostics.
     """
-    modality:       str
-    record_names:   np.ndarray
-    y_pred:         np.ndarray
-    sigma:          np.ndarray
+
+    modality: str
+    record_names: np.ndarray
+    y_pred: np.ndarray
+    sigma: np.ndarray
     validation_mae: float
-    y_true:         np.ndarray | None = None
-    class_probs:    np.ndarray | None = None
-    metadata:       dict[str, Any]    = field(default_factory=dict)
+    y_true: np.ndarray | None = None
+    class_probs: np.ndarray | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.record_names = np.asarray(self.record_names)
-        self.y_pred       = np.asarray(self.y_pred, dtype=np.float64)
-        self.sigma        = np.broadcast_to(
+        self.y_pred = np.asarray(self.y_pred, dtype=np.float64)
+        self.sigma = np.broadcast_to(
             np.asarray(self.sigma, dtype=np.float64), self.y_pred.shape
         ).copy()
         if self.y_true is not None:
             self.y_true = np.asarray(self.y_true, dtype=np.float64)
 
     def to_dataframe(self) -> pd.DataFrame:
-        df = pd.DataFrame({
-            "record_name": self.record_names,
-            "y_pred":      self.y_pred,
-            "sigma":       self.sigma,
-            "modality":    self.modality,
-            "validation_mae": self.validation_mae,
-        })
+        df = pd.DataFrame(
+            {
+                "record_name": self.record_names,
+                "y_pred": self.y_pred,
+                "sigma": self.sigma,
+                "modality": self.modality,
+                "validation_mae": self.validation_mae,
+            }
+        )
         if self.y_true is not None:
             df["depth_mm"] = self.y_true
             df["residual"] = self.y_pred - self.y_true
@@ -119,11 +122,11 @@ def _align_records(
         common &= set(b.record_names.tolist())
     common_records = np.array(sorted(common))
 
-    preds_list:  list[np.ndarray] = []
+    preds_list: list[np.ndarray] = []
     sigmas_list: list[np.ndarray] = []
     for b in bundles:
         idx = {r: i for i, r in enumerate(b.record_names)}
-        ii  = [idx[r] for r in common_records]
+        ii = [idx[r] for r in common_records]
         preds_list.append(b.y_pred[ii])
         sigmas_list.append(b.sigma[ii])
 
@@ -150,7 +153,7 @@ def _fuse(
             metadata={"source_modalities": [b.modality]},
         )
 
-    maes   = np.array([b.validation_mae for b in bundles])
+    maes = np.array([b.validation_mae for b in bundles])
     weights = _inverse_mae_weights(maes, min_weight=min_weight)
 
     common, preds_list, sigmas_list = _align_records(bundles)
@@ -162,10 +165,12 @@ def _fuse(
     # Propagate ground truth if all bundles have it
     y_true_fused: np.ndarray | None = None
     if all(b.y_true is not None for b in bundles):
-        _, trues, _ = _align_records([
-            PredictionBundle(b.modality, b.record_names, b.y_true, b.sigma, b.validation_mae)  # type: ignore[arg-type]
-            for b in bundles
-        ])
+        _, trues, _ = _align_records(
+            [
+                PredictionBundle(b.modality, b.record_names, b.y_true, b.sigma, b.validation_mae)  # type: ignore[arg-type]
+                for b in bundles
+            ]
+        )
         y_true_fused = trues[0]  # they should all be the same
 
     return PredictionBundle(
@@ -177,8 +182,8 @@ def _fuse(
         y_true=y_true_fused,
         metadata={
             "source_modalities": [b.modality for b in bundles],
-            "weights":           weights.tolist(),
-            "source_maes":       maes.tolist(),
+            "weights": weights.tolist(),
+            "source_maes": maes.tolist(),
         },
     )
 
@@ -214,6 +219,7 @@ def fuse_modalities(
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience: load bundles from disk and fuse
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def load_bundle_from_csv(
     csv_path: str | Path,
@@ -257,8 +263,8 @@ def save_fusion_report(
     }
     if bundle.y_true is not None:
         residuals = bundle.y_pred - bundle.y_true
-        report["holdout_mae"]   = float(np.mean(np.abs(residuals)))
-        report["holdout_rmse"]  = float(np.sqrt(np.mean(residuals ** 2)))
+        report["holdout_mae"] = float(np.mean(np.abs(residuals)))
+        report["holdout_rmse"] = float(np.sqrt(np.mean(residuals**2)))
         report["mean_uncertainty"] = float(np.mean(bundle.sigma))
 
     with open(out_dir / "fusion_report.json", "w") as fh:

@@ -19,6 +19,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 import pandas as pd
+
 from vm_micro.features.selection import SelectionConfig, select_features
 from vm_micro.utils import get_logger
 
@@ -30,16 +31,16 @@ def build_parser() -> argparse.ArgumentParser:
         prog="vm-select",
         description="Inverted-cone feature selection (Spearman, MI, ElasticNet, ExtraTrees).",
     )
-    p.add_argument("--features-csv",  required=True)
-    p.add_argument("--out-csv",       default=None)
-    p.add_argument("--target-col",    default="depth_mm")
-    p.add_argument("--group-col",     default="recording_root")
-    p.add_argument("--final-n",       type=int, default=15)
-    p.add_argument("--preselect-n",   type=int, default=60)
-    p.add_argument("--min-spearman",  type=float, default=0.10)
+    p.add_argument("--features-csv", required=True)
+    p.add_argument("--out-csv", default=None)
+    p.add_argument("--target-col", default="depth_mm")
+    p.add_argument("--group-col", default="recording_root")
+    p.add_argument("--final-n", type=int, default=15)
+    p.add_argument("--preselect-n", type=int, default=60)
+    p.add_argument("--min-spearman", type=float, default=0.10)
     p.add_argument("--vif-threshold", type=float, default=5.0)
-    p.add_argument("--intercorr",     type=float, default=0.75)
-    p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--intercorr", type=float, default=0.75)
+    p.add_argument("--seed", type=int, default=42)
     return p
 
 
@@ -50,14 +51,14 @@ def main() -> None:
     logger.info("Loaded %d rows × %d cols from %s", *df.shape, args.features_csv)
 
     cfg = SelectionConfig(
-        target_col              =args.target_col,
-        group_col               =args.group_col,
-        final_max_features      =args.final_n,
-        preselect_top_n         =args.preselect_n,
-        min_target_abs_spearman =args.min_spearman,
-        vif_threshold           =args.vif_threshold,
-        intercorr_threshold     =args.intercorr,
-        seed                    =args.seed,
+        target_col=args.target_col,
+        group_col=args.group_col,
+        final_max_features=args.final_n,
+        preselect_top_n=args.preselect_n,
+        min_target_abs_spearman=args.min_spearman,
+        vif_threshold=args.vif_threshold,
+        intercorr_threshold=args.intercorr,
+        seed=args.seed,
     )
 
     out_csv = args.out_csv or args.features_csv.replace(".csv", "_selected.csv")

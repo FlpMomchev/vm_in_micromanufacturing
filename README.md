@@ -128,7 +128,7 @@ DOE files: [`docs/doe/`](docs/doe/)
 
 All evaluation (except for DL) uses **complete plate runs as holdout units** — the model never
 sees any hole from a holdout run during training, feature selection, or
-hyperparameter tuning. DL holdout evaluation is done **using single files as holdout units**, 
+hyperparameter tuning. DL holdout evaluation is done **using single files as holdout units**,
 because the model has no mechanism to memorise a run-level scalar.
 This is the only protocol that reflects real deployment.
 

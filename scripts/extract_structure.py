@@ -20,7 +20,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from vm_micro.features.structure import extract_structure
-from vm_micro.utils import load_config, apply_overrides, get_logger
+from vm_micro.utils import apply_overrides, get_logger, load_config
 
 logger = get_logger(__name__)
 
@@ -30,20 +30,18 @@ def build_parser() -> argparse.ArgumentParser:
         prog="vm-extract-struct",
         description="Extract structure-borne features from segmented HDF5 files.",
     )
-    p.add_argument("--segments-dir", required=True,
-                   help="Root directory of segmented HDF5 files.")
-    p.add_argument("--config",       default="configs/structure.yaml")
-    p.add_argument("--out-csv",      default=None)
-    p.add_argument("--file-glob",    default="**/*.h5")
-    p.add_argument("--workers",      type=int, default=4)
-    p.add_argument("override", nargs="*",
-                   help="YAML config overrides, e.g. --ds_rate=500")
+    p.add_argument("--segments-dir", required=True, help="Root directory of segmented HDF5 files.")
+    p.add_argument("--config", default="configs/structure.yaml")
+    p.add_argument("--out-csv", default=None)
+    p.add_argument("--file-glob", default="**/*.h5")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("override", nargs="*", help="YAML config overrides, e.g. --ds_rate=500")
     return p
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    cfg  = load_config(args.config)
+    cfg = load_config(args.config)
     if args.override:
         cfg = apply_overrides(cfg, args.override)
 

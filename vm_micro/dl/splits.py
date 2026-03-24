@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -87,9 +87,7 @@ def _simple_stratified_file_split(
             test_size=rel_val_fraction,
             random_state=seed + 1,
         )
-        train_rel, val_rel = next(
-            val_split.split(np.arange(len(train_val_idx)), y[train_val_idx])
-        )
+        train_rel, val_rel = next(val_split.split(np.arange(len(train_val_idx)), y[train_val_idx]))
         train_idx = train_val_idx[train_rel]
         val_idx = train_val_idx[val_rel]
     else:
@@ -278,10 +276,7 @@ def _overlap_summary(split_df: pd.DataFrame, column: str) -> dict[str, Any]:
 
     sets = {
         split_name: set(
-            split_df.loc[split_df["split"] == split_name, column]
-            .dropna()
-            .astype(str)
-            .tolist()
+            split_df.loc[split_df["split"] == split_name, column].dropna().astype(str).tolist()
         )
         for split_name in ["train", "val", "test"]
     }

@@ -6,6 +6,6 @@ and regression tasks on airborne (FLAC) and structure-borne (HDF5) audio.
 
 from .config import TrainConfig
 from .models import DepthModel
-from .training import fit_repeated_experiment, fit_final_model_all_files
+from .training import fit_final_model_all_files, fit_repeated_experiment
 
 __all__ = ["TrainConfig", "DepthModel", "fit_repeated_experiment", "fit_final_model_all_files"]

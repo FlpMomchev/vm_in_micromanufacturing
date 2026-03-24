@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import sys
 
-
 _FMT = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
 _DATEFMT = "%Y-%m-%d %H:%M:%S"
 

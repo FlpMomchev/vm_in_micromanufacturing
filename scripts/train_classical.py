@@ -15,7 +15,6 @@ convention of keeping 2 runs fully unseen.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -34,17 +33,22 @@ def build_parser() -> argparse.ArgumentParser:
         prog="vm-train-cls",
         description="Train classical ML models (RF, XGB, LGB, CatBoost, GPR …) with grouped CV.",
     )
-    p.add_argument("--features-csv",    required=True,
-                   help="Selected-features CSV produced by vm-select.")
-    p.add_argument("--out-dir",         required=True,
-                   help="Output directory (will contain final_model/ subfolder).")
-    p.add_argument("--holdout-runs",    nargs="*", default=None,
-                   help="recording_root values to hold out (e.g. the 2 DL-unseen runs).")
-    p.add_argument("--train-fraction",  type=float, default=0.70)
-    p.add_argument("--cv-folds",        type=int,   default=5)
-    p.add_argument("--skip-slow",       action="store_true",
-                   help="Skip SVR and KernelRidge (O(n²-n³)).")
-    p.add_argument("--seed",            type=int,   default=42)
+    p.add_argument(
+        "--features-csv", required=True, help="Selected-features CSV produced by vm-select."
+    )
+    p.add_argument(
+        "--out-dir", required=True, help="Output directory (will contain final_model/ subfolder)."
+    )
+    p.add_argument(
+        "--holdout-runs",
+        nargs="*",
+        default=None,
+        help="recording_root values to hold out (e.g. the 2 DL-unseen runs).",
+    )
+    p.add_argument("--train-fraction", type=float, default=0.70)
+    p.add_argument("--cv-folds", type=int, default=5)
+    p.add_argument("--skip-slow", action="store_true", help="Skip SVR and KernelRidge (O(n²-n³)).")
+    p.add_argument("--seed", type=int, default=42)
     return p
 
 
@@ -52,13 +56,13 @@ def main() -> None:
     args = build_parser().parse_args()
 
     result = train_classical(
-        features_csv   =args.features_csv,
-        out_dir        =args.out_dir,
-        holdout_runs   =args.holdout_runs,
-        train_fraction =args.train_fraction,
-        n_cv_folds     =args.cv_folds,
+        features_csv=args.features_csv,
+        out_dir=args.out_dir,
+        holdout_runs=args.holdout_runs,
+        train_fraction=args.train_fraction,
+        n_cv_folds=args.cv_folds,
         skip_slow_models=args.skip_slow,
-        seed           =args.seed,
+        seed=args.seed,
     )
 
     print("\n=== Training complete ===")

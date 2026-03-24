@@ -6,9 +6,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.signal import resample_poly
 import soundfile as sf
 import torch
+from scipy.signal import resample_poly
 from torch.utils.data import Dataset
 
 from .config import TrainConfig
@@ -134,9 +134,7 @@ class WaveformWindowDataset(Dataset):
     def __getitem__(self, idx: int) -> dict[str, Any]:
         record = self.window_records[idx]
         waveform_full = self._load_full_audio_resampled(record.path)
-        waveform = waveform_full[
-            record.start_target : record.start_target + record.frames_target
-        ]
+        waveform = waveform_full[record.start_target : record.start_target + record.frames_target]
 
         if waveform.size < record.frames_target:
             waveform = np.pad(waveform, (0, record.frames_target - waveform.size))

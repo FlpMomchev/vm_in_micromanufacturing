@@ -81,7 +81,9 @@ class SpecAugment2D(nn.Module):
         self.freq_masks = int(freq_masks)
         self.freq_width = int(freq_width)
 
-    def _mask_along_axis(self, x: torch.Tensor, axis: int, n_masks: int, max_width: int) -> torch.Tensor:
+    def _mask_along_axis(
+        self, x: torch.Tensor, axis: int, n_masks: int, max_width: int
+    ) -> torch.Tensor:
         if n_masks <= 0 or max_width <= 0:
             return x
 
@@ -203,7 +205,9 @@ class SpecResNetBackbone(nn.Module):
 
 
 class HybridSpecTransformerBackbone(nn.Module):
-    def __init__(self, embed_dim: int, token_grid_size: int, transformer_layers: int, dropout: float) -> None:
+    def __init__(
+        self, embed_dim: int, token_grid_size: int, transformer_layers: int, dropout: float
+    ) -> None:
         super().__init__()
         self.stem = nn.Sequential(
             ConvNormAct(1, 32, stride=2),

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import joblib
-import numpy as np
 import pandas as pd
 
 from ..utils import get_logger
@@ -35,29 +34,29 @@ def infer_classical(
     DataFrame with columns: record_name, depth_mm (true), y_pred, residual.
     """
     bundle: dict[str, Any] = joblib.load(bundle_path)
-    model      = bundle["model"]
-    feat_cols  = bundle["feature_cols"]
-    modality   = bundle.get("modality", "unknown")
+    model = bundle["model"]
+    feat_cols = bundle["feature_cols"]
+    modality = bundle.get("modality", "unknown")
     holdout_mae = float(bundle.get("holdout_mae", float("nan")))
-    sigma_pred  = float(bundle.get("sigma_pred",  float("nan")))
-    sigma_mae   = float(bundle.get("sigma_mae",   float("nan")))
+    sigma_pred = float(bundle.get("sigma_pred", float("nan")))
+    sigma_mae = float(bundle.get("sigma_mae", float("nan")))
 
     df = pd.read_csv(features_csv)
     missing = [c for c in feat_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Features CSV is missing columns: {missing[:5]}")
 
-    X    = df[feat_cols].to_numpy()
+    X = df[feat_cols].to_numpy()
     pred = model.predict(X)
 
     out = df[["record_name"]].copy()
     if "depth_mm" in df.columns:
         out["depth_mm"] = df["depth_mm"].values
-    out["y_pred"]      = pred
-    out["modality"]    = modality
+    out["y_pred"] = pred
+    out["modality"] = modality
     out["holdout_mae"] = holdout_mae
-    out["sigma_pred"]  = sigma_pred
-    out["sigma_mae"]   = sigma_mae
+    out["sigma_pred"] = sigma_pred
+    out["sigma_mae"] = sigma_mae
 
     if "depth_mm" in out.columns:
         out["residual"] = out["y_pred"] - out["depth_mm"]

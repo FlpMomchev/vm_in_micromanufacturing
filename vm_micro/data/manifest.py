@@ -11,10 +11,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # DOE
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def load_doe(xlsx_path: str | Path, sheet_name: str = "DOE_run_order") -> pd.DataFrame:
     """Load the DOE run-order sheet from the Excel manifest."""
@@ -28,6 +28,7 @@ def load_doe(xlsx_path: str | Path, sheet_name: str = "DOE_run_order") -> pd.Dat
 # ─────────────────────────────────────────────────────────────────────────────
 # Segment manifest
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def load_manifest(csv_path: str | Path) -> pd.DataFrame:
     """Load a segments manifest CSV produced by the splitter."""
@@ -44,10 +45,7 @@ def load_expected_map_csv(csv_path: str | Path) -> dict[str, int]:
     return dict(zip(df["stem"].astype(str), df["expected_segments"].astype(int)))
 
 
-def map_segments_to_doe(
-    doe_df: pd.DataFrame,
-    n_segments: int
-) -> pd.DataFrame:
+def map_segments_to_doe(doe_df: pd.DataFrame, n_segments: int) -> pd.DataFrame:
     """Return a DOE slice for the first *n_segments* rows.
 
     Extra segments beyond the DOE length are marked ``status='extra_segment'``.
@@ -66,7 +64,7 @@ def map_segments_to_doe(
                 "HoleID": [pd.NA] * extra_n,
                 "Depth_mm": [pd.NA] * extra_n,
                 "doe_row_index0": np.arange(n_doe, n_doe + extra_n, dtype=int),
-                "status": ["extra_segment"] * extra_n
+                "status": ["extra_segment"] * extra_n,
             }
         )
         mapped = pd.concat([mapped, extras], ignore_index=True)
@@ -80,7 +78,7 @@ def map_segments_to_doe(
 
 _SAFE_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 _DEPTH_RE = re.compile(r"depth([0-9]+(?:[.,][0-9]+)?)", flags=re.IGNORECASE)
-_STEP_RE  = re.compile(r"__step([0-9]+)__", flags=re.IGNORECASE)
+_STEP_RE = re.compile(r"__step([0-9]+)__", flags=re.IGNORECASE)
 
 
 def safe_slug(s: str) -> str:
@@ -132,18 +130,13 @@ def extract_recording_root(stem: str) -> str:
 
 
 def build_segment_filename(
-    stem: str,
-    seg_idx: int,
-    step: object,
-    hole: object,
-    depth: object,
-    ext: str
+    stem: str, seg_idx: int, step: object, hole: object, depth: object, ext: str
 ) -> str:
     """Construct the canonical segment filename.
 
     Format: ``{stem}__seg{NNN}__step{SSS}__{HOLE}__depth{D.DDD}{ext}``
     """
-    step_s  = f"{int(step):03d}" if step is not None and str(step) != "<NA>" else "NA"
-    hole_s  = safe_slug(str(hole)) if hole is not None and str(hole) != "<NA>" else "NA"
+    step_s = f"{int(step):03d}" if step is not None and str(step) != "<NA>" else "NA"
+    hole_s = safe_slug(str(hole)) if hole is not None and str(hole) != "<NA>" else "NA"
     depth_s = fmt_float_for_name(depth, decimals=3)
     return f"{stem}__seg{seg_idx:03d}__step{step_s}__{hole_s}__depth{depth_s}{ext}"

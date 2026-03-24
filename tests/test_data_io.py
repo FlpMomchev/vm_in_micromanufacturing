@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import io
-import tempfile
 from pathlib import Path
 
 import h5py
@@ -11,25 +9,15 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from vm_micro.data.io import (
-    get_input_kind,
-    read_audio_mono,
-    read_measurement_h5,
-    read_signal_auto
-)
+from vm_micro.data.io import get_input_kind, read_audio_mono, read_measurement_h5, read_signal_auto
 from vm_micro.data.manifest import (
     build_segment_filename,
     extract_recording_root,
     parse_depth_mm,
     try_parse_depth_mm,
-    try_parse_step_idx
+    try_parse_step_idx,
 )
-from vm_micro.data.splitter import (
-    apply_padding,
-    band_envelope_db,
-    detect_segments
-)
-
+from vm_micro.data.splitter import apply_padding, band_envelope_db, detect_segments
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -50,9 +38,9 @@ def _silence(sr: int, duration: float) -> np.ndarray:
 @pytest.fixture
 def synthetic_recording(tmp_path: Path) -> Path:
     """FLAC with 3 short drilling bursts at 3 kHz separated by silence."""
-    burst   = _sine_burst(SR, freq=3000.0, duration=0.5)
+    burst = _sine_burst(SR, freq=3000.0, duration=0.5)
     silence = _silence(SR, duration=0.8)
-    signal  = np.concatenate([silence, burst, silence, burst, silence, burst, silence])
+    signal = np.concatenate([silence, burst, silence, burst, silence, burst, silence])
     p = tmp_path / "0503_1_2_4532.flac"
     sf.write(str(p), signal, SR)
     return p
@@ -61,9 +49,9 @@ def synthetic_recording(tmp_path: Path) -> Path:
 @pytest.fixture
 def synthetic_h5(tmp_path: Path) -> Path:
     """HDF5 file with the same signal pattern."""
-    burst   = _sine_burst(SR, freq=3000.0, duration=0.5)
+    burst = _sine_burst(SR, freq=3000.0, duration=0.5)
     silence = _silence(SR, duration=0.8)
-    signal  = np.concatenate([silence, burst, silence, burst, silence, burst, silence])
+    signal = np.concatenate([silence, burst, silence, burst, silence, burst, silence])
     t = np.arange(len(signal), dtype=np.float64) / SR
     p = tmp_path / "struct_test.h5"
     with h5py.File(str(p), "w") as fh:
@@ -77,13 +65,14 @@ def synthetic_h5(tmp_path: Path) -> Path:
 # get_input_kind
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_get_input_kind_audio():
     assert get_input_kind("file.flac") == "audio"
-    assert get_input_kind("file.wav")  == "audio"
+    assert get_input_kind("file.wav") == "audio"
 
 
 def test_get_input_kind_hdf5():
-    assert get_input_kind("file.h5")   == "hdf5"
+    assert get_input_kind("file.h5") == "hdf5"
     assert get_input_kind("file.hdf5") == "hdf5"
 
 
@@ -95,6 +84,7 @@ def test_get_input_kind_unknown():
 # ─────────────────────────────────────────────────────────────────────────────
 # read_audio_mono
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_read_audio_mono(synthetic_recording: Path):
     y, sr = read_audio_mono(synthetic_recording)
@@ -114,6 +104,7 @@ def test_read_audio_mono_resamples(synthetic_recording: Path):
 # read_measurement_h5
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_read_measurement_h5(synthetic_h5: Path):
     y, sr, tv, meta = read_measurement_h5(synthetic_h5)
     assert y.ndim == 1
@@ -126,6 +117,7 @@ def test_read_measurement_h5(synthetic_h5: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 # read_signal_auto — format dispatch
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_read_signal_auto_flac(synthetic_recording: Path):
     sig = read_signal_auto(synthetic_recording)
@@ -145,6 +137,7 @@ def test_read_signal_auto_h5(synthetic_h5: Path):
 # Manifest helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_parse_depth_mm():
     assert parse_depth_mm("0503_1_2_4532__seg001__step001__B2__depth0.500") == pytest.approx(0.5)
     assert parse_depth_mm("depth1.000") == pytest.approx(1.0)
@@ -160,7 +153,9 @@ def test_try_parse_step_idx():
 
 
 def test_extract_recording_root():
-    assert extract_recording_root("0503_1_2_4532__seg001__step001__B2__depth0.500") == "0503_1_2_4532"
+    assert (
+        extract_recording_root("0503_1_2_4532__seg001__step001__B2__depth0.500") == "0503_1_2_4532"
+    )
     assert extract_recording_root("noseg") == "noseg"
 
 
@@ -175,6 +170,7 @@ def test_build_segment_filename():
 # ─────────────────────────────────────────────────────────────────────────────
 # Segmentation
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_band_envelope_db(synthetic_recording: Path):
     y, sr = read_audio_mono(synthetic_recording)

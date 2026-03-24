@@ -20,7 +20,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from vm_micro.features.airborne import extract_airborne
-from vm_micro.utils import load_config, apply_overrides, get_logger
+from vm_micro.utils import apply_overrides, get_logger, load_config
 
 logger = get_logger(__name__)
 
@@ -30,23 +30,26 @@ def build_parser() -> argparse.ArgumentParser:
         prog="vm-extract-air",
         description="Extract airborne acoustic features from segmented FLAC files.",
     )
-    p.add_argument("--segments-dir", required=True,
-                   help="Root directory of segmented audio files.")
-    p.add_argument("--config",       default="configs/airborne.yaml",
-                   help="Path to airborne.yaml config.")
-    p.add_argument("--out-csv",      default=None,
-                   help="Output CSV path.  Defaults to outputs/features/airborne/features.csv.")
-    p.add_argument("--file-glob",    default="**/*.flac",
-                   help="Glob pattern for audio files under segments-dir.")
-    p.add_argument("--workers",      type=int, default=4)
-    p.add_argument("override", nargs="*",
-                   help="YAML config overrides, e.g. --dwt_wavelet=db4")
+    p.add_argument("--segments-dir", required=True, help="Root directory of segmented audio files.")
+    p.add_argument(
+        "--config", default="configs/airborne.yaml", help="Path to airborne.yaml config."
+    )
+    p.add_argument(
+        "--out-csv",
+        default=None,
+        help="Output CSV path.  Defaults to outputs/features/airborne/features.csv.",
+    )
+    p.add_argument(
+        "--file-glob", default="**/*.flac", help="Glob pattern for audio files under segments-dir."
+    )
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("override", nargs="*", help="YAML config overrides, e.g. --dwt_wavelet=db4")
     return p
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    cfg  = load_config(args.config)
+    cfg = load_config(args.config)
     if args.override:
         cfg = apply_overrides(cfg, args.override)
 

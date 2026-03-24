@@ -3,27 +3,24 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from vm_micro.fusion.fuser import (
     PredictionBundle,
     fuse_intra_modality,
     fuse_modalities,
     load_bundle_from_csv,
-    save_fusion_report
+    save_fusion_report,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
 # ─────────────────────────────────────────────────────────────────────────────
 
 _RECORDS = np.array([f"run01__seg{i:03d}" for i in range(20)])
-_DEPTHS  = np.linspace(0.1, 1.0, 20)
+_DEPTHS = np.linspace(0.1, 1.0, 20)
 RNG = np.random.default_rng(7)
 
 
@@ -32,7 +29,7 @@ def _make_bundle(
     val_mae: float,
     noise: float = 0.05,
     records: np.ndarray = _RECORDS,
-    depths:  np.ndarray = _DEPTHS,
+    depths: np.ndarray = _DEPTHS,
 ) -> PredictionBundle:
     preds = depths + RNG.normal(0, noise, size=len(depths))
     sigma = np.full(len(depths), noise)
@@ -50,6 +47,7 @@ def _make_bundle(
 # PredictionBundle
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_bundle_shapes():
     b = _make_bundle("test", 0.05)
     assert b.y_pred.shape == b.sigma.shape == b.record_names.shape
@@ -60,8 +58,8 @@ def test_bundle_to_dataframe():
     b = _make_bundle("test", 0.05)
     df = b.to_dataframe()
     assert "record_name" in df.columns
-    assert "y_pred"      in df.columns
-    assert "sigma"       in df.columns
+    assert "y_pred" in df.columns
+    assert "sigma" in df.columns
     assert len(df) == len(_RECORDS)
 
 
@@ -69,24 +67,25 @@ def test_bundle_to_dataframe():
 # fuse_intra_modality
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_intra_fusion_output_shape():
     cls_b = _make_bundle("airborne_classical", val_mae=0.060)
-    dl_b  = _make_bundle("airborne_dl",        val_mae=0.045)
+    dl_b = _make_bundle("airborne_dl", val_mae=0.045)
     fused = fuse_intra_modality(cls_b, dl_b, "airborne_ensemble")
 
     assert fused.modality == "airborne_ensemble"
     assert len(fused.y_pred) == len(_RECORDS)
-    assert len(fused.sigma)  == len(_RECORDS)
+    assert len(fused.sigma) == len(_RECORDS)
 
 
 def test_intra_fusion_better_model_gets_higher_weight():
     """The DL model has lower MAE → higher weight → fused prediction closer to DL."""
     cls_b = _make_bundle("cls", val_mae=0.200, noise=0.0)
-    dl_b  = _make_bundle("dl",  val_mae=0.050, noise=0.0)
+    dl_b = _make_bundle("dl", val_mae=0.050, noise=0.0)
 
     fused = fuse_intra_modality(cls_b, dl_b, "ensemble")
     w_cls = 1 / 0.200
-    w_dl  = 1 / 0.050
+    w_dl = 1 / 0.050
     w_dl_norm = w_dl / (w_cls + w_dl)
     # The fused prediction should be a weighted average
     expected = w_dl_norm * dl_b.y_pred + (1 - w_dl_norm) * cls_b.y_pred
@@ -95,7 +94,7 @@ def test_intra_fusion_better_model_gets_higher_weight():
 
 def test_intra_fusion_sigma_propagation():
     cls_b = _make_bundle("cls", val_mae=0.060)
-    dl_b  = _make_bundle("dl",  val_mae=0.040)
+    dl_b = _make_bundle("dl", val_mae=0.040)
     fused = fuse_intra_modality(cls_b, dl_b, "ensemble")
     # σ_fused = sqrt((w1*σ1)² + (w2*σ2)²) — must be positive
     assert np.all(fused.sigma >= 0)
@@ -106,8 +105,9 @@ def test_intra_fusion_sigma_propagation():
 # fuse_modalities (inter)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_inter_fusion_two_modalities():
-    air   = _make_bundle("airborne_ensemble",  val_mae=0.040)
+    air = _make_bundle("airborne_ensemble", val_mae=0.040)
     struc = _make_bundle("structure_ensemble", val_mae=0.060)
     final = fuse_modalities(air, struc)
 
@@ -127,6 +127,7 @@ def test_single_modality_passthrough():
 # Record alignment
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def test_fusion_aligns_records_to_intersection():
     records_a = np.array([f"seg{i:03d}" for i in range(10)])
     records_b = np.array([f"seg{i:03d}" for i in range(5, 15)])
@@ -142,6 +143,7 @@ def test_fusion_aligns_records_to_intersection():
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def test_save_and_reload_report(tmp_path: Path):
     b = _make_bundle("airborne_ensemble", val_mae=0.040)

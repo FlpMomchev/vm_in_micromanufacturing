@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -20,7 +20,6 @@ class EpochStats:
     seconds: float
 
 
-
 def make_loader(ds, cfg: TrainConfig, shuffle: bool) -> DataLoader:
     loader_kwargs: dict[str, Any] = {
         "dataset": ds,
@@ -36,13 +35,11 @@ def make_loader(ds, cfg: TrainConfig, shuffle: bool) -> DataLoader:
     return DataLoader(**loader_kwargs)
 
 
-
 def move_batch(batch: dict[str, Any], device: str) -> dict[str, Any]:
     return {
         key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
         for key, value in batch.items()
     }
-
 
 
 def build_loss(cfg: TrainConfig, train_df: pd.DataFrame):
@@ -59,7 +56,6 @@ def build_loss(cfg: TrainConfig, train_df: pd.DataFrame):
     return torch.nn.HuberLoss(delta=0.1)
 
 
-
 def _compute_loss(
     cfg: TrainConfig,
     criterion,
@@ -69,7 +65,6 @@ def _compute_loss(
     if cfg.task == "classification":
         return criterion(output["logits"], batch["y"])
     return criterion(output["regression"], batch["y"])
-
 
 
 def train_one_epoch(
@@ -174,7 +169,6 @@ def predict_loader(model, loader, device: str, cfg: TrainConfig) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
-
 def aggregate_file_predictions(
     pred_df: pd.DataFrame,
     file_df: pd.DataFrame,
@@ -201,11 +195,7 @@ def aggregate_file_predictions(
             raise ValueError("Classification aggregation requires class_to_depth.")
         agg["y_pred_depth"] = agg["y_pred_class"].map(class_to_depth)
 
-        truth = (
-            pred_df.groupby("file_id")[["y_true_class", "y_true_depth"]]
-            .first()
-            .reset_index()
-        )
+        truth = pred_df.groupby("file_id")[["y_true_class", "y_true_depth"]].first().reset_index()
         agg = agg.merge(truth, on="file_id", how="left")
 
         emb_cols = [col for col in pred_df.columns if col.startswith("emb_")]
@@ -230,7 +220,6 @@ def aggregate_file_predictions(
     return agg.merge(file_df[join_cols], on="file_id", how="left")
 
 
-
 def evaluate_file_level(file_pred_df: pd.DataFrame, cfg: TrainConfig) -> dict[str, float]:
     if cfg.task == "classification":
         metrics = classification_metrics(
@@ -239,7 +228,9 @@ def evaluate_file_level(file_pred_df: pd.DataFrame, cfg: TrainConfig) -> dict[st
         )
         prob_cols = [col for col in file_pred_df.columns if col.startswith("p_")]
         if prob_cols:
-            metrics["mean_confidence"] = float(file_pred_df[prob_cols].to_numpy().max(axis=1).mean())
+            metrics["mean_confidence"] = float(
+                file_pred_df[prob_cols].to_numpy().max(axis=1).mean()
+            )
         return metrics
 
     metrics = regression_metrics(

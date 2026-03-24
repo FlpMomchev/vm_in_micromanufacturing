@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import math
 import random
 import re
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -19,7 +19,6 @@ from sklearn.metrics import (
     mean_squared_error,
     r2_score,
 )
-
 
 DEPTH_RE = re.compile(r"depth\s*([0-9]+(?:[.,][0-9]+)?)", flags=re.IGNORECASE)
 STEP_RE = re.compile(r"__step\s*([0-9]+)__", flags=re.IGNORECASE)

@@ -42,7 +42,6 @@ class FinalModelResult:
     final_model_dir: Path
 
 
-
 def _build_scheduler(optimizer, cfg: TrainConfig, total_epochs: int) -> LambdaLR:
     """
     Linear warmup followed by cosine annealing to lr_min.
@@ -70,10 +69,8 @@ def _build_scheduler(optimizer, cfg: TrainConfig, total_epochs: int) -> LambdaLR
     return LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
 
-
 def _repeat_dir(root_out_dir: Path, repeat_idx: int, n_repeats: int) -> Path:
     return root_out_dir if n_repeats == 1 else root_out_dir / f"repeat_{repeat_idx:03d}"
-
 
 
 def _make_model(cfg: TrainConfig, out_dim: int, device: str):
@@ -83,17 +80,14 @@ def _make_model(cfg: TrainConfig, out_dim: int, device: str):
     return model
 
 
-
 def _selection_objective(cfg: TrainConfig, metrics: dict[str, float]) -> float:
     if cfg.task == "classification":
         return float(metrics["balanced_accuracy"])
     return float(-metrics["mae"])
 
 
-
 def _classification_labels(class_to_depth: dict[int, float]) -> list[str]:
     return [f"{class_to_depth[idx]:.3f}" for idx in sorted(class_to_depth)]
-
 
 
 def fit_single_repeat(
@@ -264,7 +258,6 @@ def fit_single_repeat(
     )
 
 
-
 def fit_repeated_experiment(
     cfg: TrainConfig,
     file_df: pd.DataFrame,
@@ -315,9 +308,7 @@ def fit_repeated_experiment(
 
     if not summary_df.empty:
         numeric_cols = [
-            col
-            for col in summary_df.columns
-            if col not in {"repeat_idx", "seed", "repeat_dir"}
+            col for col in summary_df.columns if col not in {"repeat_idx", "seed", "repeat_dir"}
         ]
         summary_payload: dict[str, float] = {}
         for col in numeric_cols:
@@ -327,7 +318,6 @@ def fit_repeated_experiment(
 
     write_label_mapping(class_to_depth, root_out_dir / "label_mapping.json")
     return ExperimentResult(summary_df=summary_df)
-
 
 
 def choose_final_training_epochs(
@@ -341,7 +331,6 @@ def choose_final_training_epochs(
         raise ValueError("Cannot infer final training epochs without repeat-level best_epoch data.")
 
     return int(np.median(summary_df["best_epoch"].to_numpy(dtype=int)))
-
 
 
 def fit_final_model_all_files(
@@ -446,7 +435,6 @@ def fit_final_model_all_files(
         final_epochs=int(final_epochs),
         final_model_dir=final_model_dir,
     )
-
 
 
 def make_main_split_builder(

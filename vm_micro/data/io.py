@@ -18,13 +18,12 @@ import numpy as np
 import soundfile as sf
 from scipy.signal import resample_poly
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Format detection
 # ─────────────────────────────────────────────────────────────────────────────
 
 _AUDIO_SUFFIXES = {".flac", ".wav", ".ogg", ".aiff", ".aif"}
-_HDF5_SUFFIXES  = {".h5", ".hdf5"}
+_HDF5_SUFFIXES = {".h5", ".hdf5"}
 
 
 def get_input_kind(path: str | Path) -> str:
@@ -41,21 +40,17 @@ def get_input_kind(path: str | Path) -> str:
 # Audio (FLAC / WAV)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _resample(y: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
     if sr_in == sr_out:
         return y.astype(np.float32, copy=False)
     factor = gcd(sr_in, sr_out)
     return resample_poly(
-        y.astype(np.float32, copy=False),
-        up=sr_out // factor,
-        down=sr_in // factor
+        y.astype(np.float32, copy=False), up=sr_out // factor, down=sr_in // factor
     ).astype(np.float32)
 
 
-def read_audio_mono(
-    path: str | Path,
-    target_sr: int | None = None
-) -> tuple[np.ndarray, int]:
+def read_audio_mono(path: str | Path, target_sr: int | None = None) -> tuple[np.ndarray, int]:
     """Read FLAC/WAV, downmix to mono float32, optionally resample."""
     path = Path(path)
     y, sr = sf.read(path, always_2d=True)
@@ -69,6 +64,7 @@ def read_audio_mono(
 # ─────────────────────────────────────────────────────────────────────────────
 # HDF5 measurements (structure-borne)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _infer_sr_from_time_vector(
     time_vector: np.ndarray,
@@ -95,7 +91,7 @@ def read_measurement_h5(
     data_key: str = "measurement/data",
     time_key: str = "measurement/time_vector",
     center_signal: bool = True,
-    target_sr: int | None = None
+    target_sr: int | None = None,
 ) -> tuple[np.ndarray, int, np.ndarray, dict[str, Any]]:
     """Read one HDF5 measurement file.
 
@@ -113,9 +109,7 @@ def read_measurement_h5(
 
     y = np.asarray(data, dtype=np.float32)
     if y.ndim != 1:
-        raise ValueError(
-            f"Expected 1-D dataset at {data_key!r}, got shape {y.shape}"
-        )
+        raise ValueError(f"Expected 1-D dataset at {data_key!r}, got shape {y.shape}")
 
     sr, dt_median, jitter = _infer_sr_from_time_vector(time_vector)
 
@@ -134,7 +128,7 @@ def read_measurement_h5(
         "dt_median_s": float(dt_median),
         "relative_time_jitter": float(jitter),
         "data_key": data_key,
-        "time_key": time_key
+        "time_key": time_key,
     }
     return y.astype(np.float32, copy=False), int(sr), tv, meta
 
@@ -143,13 +137,14 @@ def read_measurement_h5(
 # Unified reader
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def read_signal_auto(
     path: str | Path,
     *,
     target_sr: int | None = None,
     h5_data_key: str = "measurement/data",
     h5_time_key: str = "measurement/time_vector",
-    center_h5_signal: bool = True
+    center_h5_signal: bool = True,
 ) -> dict[str, Any]:
     """Read either format and return a unified signal dict.
 
@@ -172,7 +167,7 @@ def read_signal_auto(
             data_key=h5_data_key,
             time_key=h5_time_key,
             center_signal=center_h5_signal,
-            target_sr=target_sr
+            target_sr=target_sr,
         )
 
     if len(time_vector) > 1:
@@ -190,5 +185,5 @@ def read_signal_auto(
         "sr": int(sr),
         "time_vector": np.asarray(time_vector, dtype=np.float64),
         "duration_s": float(duration_s),
-        **meta
+        **meta,
     }
