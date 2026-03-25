@@ -1,5 +1,5 @@
 """
-StructureBorneFeatureExtractorV2
+StructureBorneFeatureExtractorExtensive
 ================================
 Redesigned feature extraction for structure-borne acoustic signals
 in micro-drilling depth prediction.
@@ -18,17 +18,9 @@ Key improvements over V1:
   7. CWT scale energy fractions (kept for comparability with airborne pipeline).
   8. Complexity measures (sample entropy, permutation entropy, Lempel-Ziv).
 
-Interface
----------
-    extractor = StructureBorneFeatureExtractorV2(fs_native=3_125_000)
-    features  = extractor.extract(raw_signal)   # dict  {str: float}
-
 The returned dict contains *only* scalar feature values; meta-columns
 (modality, record_name, depth_mm, …) must be added by the calling pipeline,
 exactly as in the existing CSV schema.
-
-Dependencies: numpy, scipy, pywt (PyWavelets), pandas (optional, for
-DataFrame conversion).
 """
 
 from __future__ import annotations
