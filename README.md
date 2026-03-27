@@ -16,11 +16,6 @@ Virtual metrology pipeline for micro-drilling depth prediction from acoustic sen
 - `vm-predict-fused` is available for one-shot production-style flow (`raw -> split -> infer -> fuse`).
 - Automated tests exist for data I/O/splitting, features, classical, and fusion modules.
 
-## Result Upload Policy
-
-At this stage, do not upload new result dumps into arbitrary subfolders (for example under `models/**`).
-
-Exception: `results/` is the intended place for curated, shareable benchmark exports when those are committed.
 
 ## Repository Structure
 
