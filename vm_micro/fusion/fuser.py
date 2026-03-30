@@ -1,30 +1,14 @@
-"""vm_micro.fusion.fuser
-~~~~~~~~~~~~~~~~~~~~~~~~
-Self-contained fusion layer.
+"""vm_micro.fusion.fuser -- Self-contained fusion layer.
 
-Architecture
-------------
-Stage 1: intra-modality fusion
-    airborne_classical + airborne_dl   -> airborne_ensemble
-    structure_classical + structure_dl -> structure_ensemble
+Stage 1 (intra-modality):
+    classical + DL  ->  modality ensemble  (weighted by inverse validation MAE)
 
-Stage 2: inter-modality fusion
-    airborne_ensemble + structure_ensemble -> final prediction
+Stage 2 (inter-modality):
+    airborne ensemble + structure ensemble  ->  final prediction
 
-Each stage uses **inverse-MAE weighted averaging**:
-    w_i = 1 / (MAE_i + eps)           (raw weight)
-    w_i = max(w_i, min_weight)        (floor to avoid zero weight)
-    w_i = w_i / sum_j w_j             (normalise)
-
-Uncertainty is propagated as:
-    sigma_out = sqrt(sum_i((w_i * sigma_i) ** 2))
-
-Interface contract
-------------------
-Every upstream model produces a :class:`PredictionBundle`.  The fuser
-consumes a *list* of bundles and returns a single merged bundle.
-
-To swap out the fusion strategy later, only this file needs to change.
+Uncertainty:
+    intra  : sigma = sqrt(sum_i w_i * (x_i - mu)^2)           (disagreement)
+    inter  : sigma = sqrt(sum_i w_i * ((mu_i - mu)^2 + s_i^2)) (hierarchical)
 """
 
 from __future__ import annotations
@@ -37,6 +21,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+_EPS = 1e-9
+
+
+# ---------------------------------------------------------------------------
+# PredictionBundle
+# ---------------------------------------------------------------------------
+
 
 @dataclass
 class PredictionBundle:
@@ -44,16 +35,13 @@ class PredictionBundle:
 
     Parameters
     ----------
-    modality        : One of ``'airborne_classical'``, ``'airborne_dl'``,
-                      ``'structure_classical'``, ``'structure_dl'``, or a
-                      merged name like ``'airborne_ensemble'``.
+    modality        : e.g. ``'airborne_classical'``, ``'airborne_ensemble'``.
     record_names    : 1-D array of segment / file identifiers.
     y_pred          : 1-D float array of depth predictions (mm).
-    sigma           : Per-prediction uncertainty (std, mm).  Set to scalar
-                      if homoscedastic.
+    sigma           : Per-prediction uncertainty (std, mm).
     validation_mae  : Scalar reference MAE used for fusion weighting.
-    y_true          : Optional ground-truth labels (mm); used for evaluation.
-    class_probs     : Optional (N, C) probability matrix (classification).
+    y_true          : Optional ground-truth labels (mm).
+    class_probs     : Optional (N, C) probability matrix.
     metadata        : Free-form dict for diagnostics.
     """
 
@@ -70,7 +58,8 @@ class PredictionBundle:
         self.record_names = np.asarray(self.record_names)
         self.y_pred = np.asarray(self.y_pred, dtype=np.float64)
         self.sigma = np.broadcast_to(
-            np.asarray(self.sigma, dtype=np.float64), self.y_pred.shape
+            np.asarray(self.sigma, dtype=np.float64),
+            self.y_pred.shape,
         ).copy()
         if self.y_true is not None:
             self.y_true = np.asarray(self.y_true, dtype=np.float64)
@@ -91,31 +80,75 @@ class PredictionBundle:
         return df
 
 
-#
-# Core fusion functions
-#
+# ---------------------------------------------------------------------------
+# Weighting primitives
+# ---------------------------------------------------------------------------
 
-_EPS = 1e-9
+
+def normalize_weights(weights: np.ndarray) -> np.ndarray:
+    """Normalise positive weights; fallback to equal weights when invalid."""
+    w = np.asarray(weights, dtype=np.float64).ravel()
+    if w.size == 0:
+        return w
+    if np.any(~np.isfinite(w)) or np.any(w <= 0):
+        return np.full(w.shape, 1.0 / w.size, dtype=np.float64)
+    total = float(np.sum(w))
+    if not np.isfinite(total) or total <= 0:
+        return np.full(w.shape, 1.0 / w.size, dtype=np.float64)
+    return w / total
+
+
+def weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    w = normalize_weights(weights)
+    if vals.shape != w.shape:
+        raise ValueError(f"Shape mismatch: values={vals.shape}, weights={w.shape}")
+    return float(np.sum(w * vals)) if vals.size else float("nan")
+
+
+def weighted_sigma(values: np.ndarray, weights: np.ndarray) -> float:
+    vals = np.asarray(values, dtype=np.float64).ravel()
+    w = normalize_weights(weights)
+    if vals.shape != w.shape:
+        raise ValueError(f"Shape mismatch: values={vals.shape}, weights={w.shape}")
+    if vals.size == 0:
+        return float("nan")
+    mu = float(np.sum(w * vals))
+    return float(np.sqrt(max(float(np.sum(w * (vals - mu) ** 2)), 0.0)))
+
+
+def hierarchical_sigma(
+    means: np.ndarray,
+    sigmas: np.ndarray,
+    weights: np.ndarray,
+) -> float:
+    mu = weighted_mean(means, weights)
+    m = np.asarray(means, dtype=np.float64).ravel()
+    s = np.asarray(sigmas, dtype=np.float64).ravel()
+    w = normalize_weights(weights)
+    if m.shape != w.shape or s.shape != w.shape:
+        raise ValueError(f"Shape mismatch: means={m.shape}, sigmas={s.shape}, weights={w.shape}")
+    if m.size == 0:
+        return float("nan")
+    return float(np.sqrt(max(float(np.sum(w * ((m - mu) ** 2 + s**2))), 0.0)))
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _inverse_mae_weights(maes: np.ndarray, min_weight: float = 0.05) -> np.ndarray:
-    """Compute normalised inverse-MAE weights with a floor."""
-    raw = 1.0 / (np.asarray(maes, dtype=np.float64) + _EPS)
-    raw = np.maximum(raw, min_weight)
-    return raw / raw.sum()
+    mae_arr = np.asarray(maes, dtype=np.float64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        raw = 1.0 / (mae_arr + _EPS)
+    return normalize_weights(np.maximum(raw, float(min_weight)))
 
 
 def _align_records(
     bundles: list[PredictionBundle],
 ) -> tuple[np.ndarray, list[np.ndarray], list[np.ndarray]]:
-    """Align multiple bundles to the intersection of their record names.
-
-    Returns
-    -------
-    common_records : sorted array of shared record names
-    preds_list     : list of aligned y_pred arrays
-    sigmas_list    : list of aligned sigma arrays
-    """
+    """Align bundles to the intersection of record names."""
     common = set(bundles[0].record_names.tolist())
     for b in bundles[1:]:
         common &= set(b.record_names.tolist())
@@ -132,7 +165,7 @@ def _align_records(
     return common_records, preds_list, sigmas_list
 
 
-def _batch_metrics_from_arrays(
+def _batch_metrics(
     y_pred: np.ndarray,
     y_true: np.ndarray | None,
 ) -> dict[str, Any]:
@@ -143,39 +176,43 @@ def _batch_metrics_from_arrays(
             "mae_mm": None,
             "rmse_mm": None,
         }
-
     yt = np.asarray(y_true, dtype=np.float64)
     yp = np.asarray(y_pred, dtype=np.float64)
     mask = np.isfinite(yt) & np.isfinite(yp)
-    n_eval = int(np.sum(mask))
-    if n_eval == 0:
+    n = int(np.sum(mask))
+    if n == 0:
         return {
             "has_ground_truth": False,
             "n_with_ground_truth": 0,
             "mae_mm": None,
             "rmse_mm": None,
         }
-
-    residuals = yp[mask] - yt[mask]
+    res = yp[mask] - yt[mask]
     return {
         "has_ground_truth": True,
-        "n_with_ground_truth": n_eval,
-        "mae_mm": float(np.mean(np.abs(residuals))),
-        "rmse_mm": float(np.sqrt(np.mean(residuals**2))),
+        "n_with_ground_truth": n,
+        "mae_mm": float(np.mean(np.abs(res))),
+        "rmse_mm": float(np.sqrt(np.mean(res**2))),
     }
 
 
 def bundle_batch_metrics(bundle: PredictionBundle) -> dict[str, Any]:
-    """Return measured current-batch metrics (if labels are present)."""
-    return _batch_metrics_from_arrays(bundle.y_pred, bundle.y_true)
+    """Current-batch metrics (if labels are present)."""
+    return _batch_metrics(bundle.y_pred, bundle.y_true)
+
+
+# ---------------------------------------------------------------------------
+# Core fusion
+# ---------------------------------------------------------------------------
 
 
 def _fuse(
     bundles: list[PredictionBundle],
     fused_modality: str,
     min_weight: float = 0.05,
+    propagate_internal_sigma: bool = True,
 ) -> PredictionBundle:
-    """Weighted average fusion of N bundles with Gaussian uncertainty propagation."""
+    """Weighted average fusion with disagreement-based uncertainty."""
     if not bundles:
         raise ValueError("Need at least one bundle to fuse.")
     if len(bundles) == 1:
@@ -187,19 +224,52 @@ def _fuse(
             sigma=b.sigma.copy(),
             validation_mae=b.validation_mae,
             y_true=b.y_true.copy() if b.y_true is not None else None,
-            metadata={"source_modalities": [b.modality]},
+            metadata={
+                "source_modalities": [b.modality],
+                "has_real_sigma": bool(b.metadata.get("has_real_sigma", False)),
+            },
         )
 
     maes = np.array([b.validation_mae for b in bundles])
     weights = _inverse_mae_weights(maes, min_weight=min_weight)
-
     common, preds_list, sigmas_list = _align_records(bundles)
+    n_rows = len(common)
+    n_models = len(preds_list)
+    preds_mat = np.vstack(preds_list) if n_models else np.zeros((0, n_rows), dtype=np.float64)
+    sigmas_mat = np.vstack(sigmas_list) if n_models else np.zeros((0, n_rows), dtype=np.float64)
 
-    y_fused = sum(w * p for w, p in zip(weights, preds_list))  # type: ignore[arg-type]
-    sigma_fused = np.sqrt(sum((w * s) ** 2 for w, s in zip(weights, sigmas_list)))  # type: ignore[arg-type]
-    mae_fused = float(np.sum(weights * maes))
+    y_fused = np.full(n_rows, np.nan, dtype=np.float64)
+    sigma_fused = np.full(n_rows, np.nan, dtype=np.float64)
+    sigma_between = np.full(n_rows, np.nan, dtype=np.float64)
 
-    # Propagate ground truth if all bundles have it
+    for i in range(n_rows):
+        row_preds = preds_mat[:, i]
+        avail = np.isfinite(row_preds)
+        if not np.any(avail):
+            continue
+        w = normalize_weights(weights[avail])
+        means = row_preds[avail]
+        y_fused[i] = float(np.sum(w * means))
+
+        bvar = max(float(np.sum(w * (means - y_fused[i]) ** 2)), 0.0)
+        sigma_between[i] = float(np.sqrt(bvar))
+
+        if propagate_internal_sigma:
+            sigs = sigmas_mat[:, i][avail]
+            sigs = np.where(np.isfinite(sigs), sigs, 0.0)
+            sigma_fused[i] = hierarchical_sigma(means, sigs, w)
+        else:
+            sigma_fused[i] = weighted_sigma(means, w)
+
+    # Fused reference MAE
+    finite_mask = np.isfinite(maes)
+    mae_fused = (
+        weighted_mean(maes[finite_mask], normalize_weights(weights[finite_mask]))
+        if np.any(finite_mask)
+        else float("nan")
+    )
+
+    # Propagate ground truth (all bundles must have it)
     y_true_fused: np.ndarray | None = None
     if all(b.y_true is not None for b in bundles):
         _, trues, _ = _align_records(
@@ -208,24 +278,47 @@ def _fuse(
                 for b in bundles
             ]
         )
-        y_true_fused = trues[0]  # they should all be the same
+        y_true_fused = trues[0]
+
+    metadata: dict[str, Any] = {
+        "source_modalities": [b.modality for b in bundles],
+        "weights": weights.tolist(),
+        "source_maes": maes.tolist(),
+        "source_batch_metrics": [
+            {"modality": b.modality, **bundle_batch_metrics(b)} for b in bundles
+        ],
+        "has_real_sigma": True,
+    }
+
+    if fused_modality == "final_fusion":
+        mod_idx = {b.modality: i for i, b in enumerate(bundles)}
+        metadata["sigma_between_modalities_mm"] = sigma_between.tolist()
+        for name, key in [
+            ("airborne_ensemble", "sigma_airborne_mm"),
+            ("structure_ensemble", "sigma_structure_mm"),
+        ]:
+            idx = mod_idx.get(name)
+            if idx is not None:
+                metadata[key] = np.where(
+                    np.isfinite(sigmas_mat[idx]),
+                    sigmas_mat[idx],
+                    np.nan,
+                ).tolist()
 
     return PredictionBundle(
         modality=fused_modality,
         record_names=common,
-        y_pred=np.asarray(y_fused),
-        sigma=np.asarray(sigma_fused),
+        y_pred=y_fused,
+        sigma=sigma_fused,
         validation_mae=mae_fused,
         y_true=y_true_fused,
-        metadata={
-            "source_modalities": [b.modality for b in bundles],
-            "weights": weights.tolist(),
-            "source_maes": maes.tolist(),
-            "source_batch_metrics": [
-                {"modality": b.modality, **bundle_batch_metrics(b)} for b in bundles
-            ],
-        },
+        metadata=metadata,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def fuse_intra_modality(
@@ -234,31 +327,26 @@ def fuse_intra_modality(
     modality_name: str,
     min_weight: float = 0.05,
 ) -> PredictionBundle:
-    """Stage 1: fuse classical + DL bundles for a single modality.
-
-    Example::
-
-        airborne = fuse_intra_modality(air_cls, air_dl, "airborne_ensemble")
-    """
-    return _fuse([classical_bundle, dl_bundle], fused_modality=modality_name, min_weight=min_weight)
+    """Stage 1: fuse classical + DL for a single modality."""
+    return _fuse(
+        [classical_bundle, dl_bundle],
+        fused_modality=modality_name,
+        min_weight=min_weight,
+        propagate_internal_sigma=False,
+    )
 
 
 def fuse_modalities(
     *modality_bundles: PredictionBundle,
     min_weight: float = 0.05,
 ) -> PredictionBundle:
-    """Stage 2: fuse any number of modality-level bundles into a final prediction.
-
-    Example::
-
-        final = fuse_modalities(airborne_ensemble, structure_ensemble)
-    """
-    return _fuse(list(modality_bundles), fused_modality="final_fusion", min_weight=min_weight)
-
-
-#
-# Convenience: load bundles from disk and fuse
-#
+    """Stage 2: fuse modality-level bundles into a final prediction."""
+    return _fuse(
+        list(modality_bundles),
+        fused_modality="final_fusion",
+        min_weight=min_weight,
+        propagate_internal_sigma=True,
+    )
 
 
 def load_bundle_from_csv(
@@ -266,9 +354,9 @@ def load_bundle_from_csv(
     modality: str,
     validation_mae: float,
 ) -> PredictionBundle:
-    """Build a :class:`PredictionBundle` from an inference CSV.
+    """Build a PredictionBundle from an inference CSV.
 
-    The CSV is expected to have at least: ``record_name``, ``y_pred``.
+    Expected columns: ``record_name``, ``y_pred``.
     Optional: ``depth_mm`` (y_true), ``sigma``.
     """
     df = pd.read_csv(csv_path)
@@ -288,19 +376,19 @@ def save_fusion_report(
     bundle: PredictionBundle,
     out_dir: str | Path,
 ) -> None:
-    """Save predictions and split outputs into report + setup JSON."""
+    """Save predictions CSV + report/setup JSON."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     bundle.to_dataframe().to_csv(out_dir / "fusion_predictions.csv", index=False)
 
-    batch_metrics = bundle_batch_metrics(bundle)
-    report = {
+    metrics = bundle_batch_metrics(bundle)
+    report: dict[str, Any] = {
         "modality": bundle.modality,
-        "n_predictions": int(len(bundle.y_pred)),
-        "batch_mae_mm": batch_metrics["mae_mm"],
-        "batch_rmse_mm": batch_metrics["rmse_mm"],
-        "n_with_ground_truth": batch_metrics["n_with_ground_truth"],
+        "n_predictions": len(bundle.y_pred),
+        "batch_mae_mm": metrics["mae_mm"],
+        "batch_rmse_mm": metrics["rmse_mm"],
+        "n_with_ground_truth": metrics["n_with_ground_truth"],
         "metric_definition": {
             "batch_mae_mm": "Mean absolute error on the current batch (mm).",
             "batch_rmse_mm": "Root mean squared error on the current batch (mm).",
@@ -313,7 +401,6 @@ def save_fusion_report(
     }
     if "source_batch_metrics" in bundle.metadata:
         report["source_batch_metrics"] = bundle.metadata["source_batch_metrics"]
-
     with open(out_dir / "fusion_report.json", "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
 
@@ -333,6 +420,5 @@ def save_fusion_report(
     }
     if meta:
         setup["metadata"] = meta
-
     with open(out_dir / "fusion_setup.json", "w", encoding="utf-8") as fh:
         json.dump(setup, fh, indent=2)

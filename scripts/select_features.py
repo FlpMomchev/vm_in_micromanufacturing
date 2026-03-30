@@ -1,11 +1,10 @@
-"""vm-select  Run the inverted-cone feature selection pipeline.
+"""vm-select -- Inverted-cone feature selection pipeline.
 
 Usage::
 
-    vm-select `
-        --features-csv data/features/airborne/features.csv `
-        --out-csv      data/features/airborne/features_selected.csv `
-        --final-n      20
+    vm-select --features-csv data/features/airborne/features.csv \
+              --out-csv data/features/airborne/features_selected.csv \
+              --final-n 20
 """
 
 from __future__ import annotations
@@ -28,10 +27,7 @@ logger = get_logger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="vm-select",
-        description="Inverted-cone feature selection (Spearman, MI, ElasticNet, ExtraTrees).",
-    )
+    p = argparse.ArgumentParser(prog="vm-select", description="Feature selection pipeline.")
     p.add_argument("--features-csv", required=True)
     p.add_argument("--out-csv", default=None)
     p.add_argument("--target-col", default="depth_mm")
@@ -43,15 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-partial-r",
         type=float,
         default=None,
-        help="If set, keep only features whose |partial Spearman r| with the "
-        "target (controlling for --partial-control-col) meets this threshold. "
-        "E.g. 0.15 to filter out duration-proxy features.",
+        help="Partial Spearman threshold (controlling for --partial-control-col).",
     )
-    p.add_argument(
-        "--partial-control-col",
-        default="duration_s",
-        help="Column to control for in the partial-correlation filter (default: duration_s).",
-    )
+    p.add_argument("--partial-control-col", default="duration_s")
     p.add_argument("--vif-threshold", type=float, default=5.0)
     p.add_argument("--intercorr", type=float, default=0.75)
     p.add_argument("--seed", type=int, default=42)
@@ -60,7 +50,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-
     df = pd.read_csv(args.features_csv)
     logger.info("Loaded %d rows  %d cols from %s", *df.shape, args.features_csv)
 
@@ -81,14 +70,11 @@ def main() -> None:
     out_dir_sweep = Path(out_csv).parent / "FS_validation"
     df_sel, selected = select_features(df, cfg, out_csv=out_csv, sweep_dir=out_dir_sweep)
 
-    src_sidecar = Path(str(Path(args.features_csv)) + ".extractor_config.json")
-    dst_sidecar = Path(str(Path(out_csv)) + ".extractor_config.json")
+    src_sidecar = Path(str(args.features_csv) + ".extractor_config.json")
+    dst_sidecar = Path(str(out_csv) + ".extractor_config.json")
     if src_sidecar.exists():
         dst_sidecar.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src_sidecar, dst_sidecar)
-        logger.info("Copied extraction sidecar %s -> %s", src_sidecar, dst_sidecar)
-    else:
-        logger.warning("No extraction sidecar found next to %s", args.features_csv)
 
     print(f"\nSelected {len(selected)} features:")
     for f in selected:

@@ -637,14 +637,21 @@ class StructureBorneFeatureExtractorExtensive:
             left, ctr, right = bins[i], bins[i + 1], bins[i + 2]
             if ctr == left:
                 ctr = left + 1
-            if right == ctr:
+            if right <= ctr:
                 right = ctr + 1
+            ctr = int(np.clip(ctr, 0, n_bins - 1))
+            right = int(np.clip(right, 0, n_bins - 1))
+            if left >= n_bins or ctr <= left:
+                continue
             # Rising slope
+            rise_den = max(ctr - left, 1)
             for j in range(left, ctr):
-                fbank[i, j] = (j - left) / (ctr - left)
+                fbank[i, j] = (j - left) / rise_den
             # Falling slope
-            for j in range(ctr, right + 1):
-                fbank[i, j] = (right - j) / (right - ctr)
+            if right > ctr:
+                fall_den = max(right - ctr, 1)
+                for j in range(right - ctr, 1):
+                    fbank[i, j] = (right - j) / fall_den
         return fbank
 
     def _build_cwt_scales(self) -> np.ndarray:

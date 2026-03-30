@@ -1391,13 +1391,7 @@ def train_classical(
         best_estimator, train_val_df, feat_cols, n_splits_max=outer_max_splits
     )
     train_oof_pred_df.to_csv(
-        out_dir / "trainval_post_selection_grouped_oof_predictions.csv", index=False
-    )
-    train_oof_pred_df.to_csv(
         out_dir / "train_post_selection_grouped_oof_predictions.csv", index=False
-    )
-    pd.DataFrame([train_oof_metrics]).to_csv(
-        out_dir / "trainval_post_selection_grouped_oof_metrics.csv", index=False
     )
     pd.DataFrame([train_oof_metrics]).to_csv(
         out_dir / "train_post_selection_grouped_oof_metrics.csv", index=False
@@ -1412,9 +1406,7 @@ def train_classical(
         snap_predictions=snap_predictions,
     )
     test_pred_df.to_csv(out_dir / "test_predictions.csv", index=False)
-    test_pred_df.to_csv(out_dir / "holdout_predictions.csv", index=False)
     pd.DataFrame([test_metrics]).to_csv(final_dir / "test_metrics.csv", index=False)
-    pd.DataFrame([test_metrics]).to_csv(final_dir / "holdout_metrics.csv", index=False)
 
     external_holdout_metrics: dict[str, Any] | None = None
     if not external_holdout_df.empty:
@@ -1482,14 +1474,10 @@ def train_classical(
             snap_predictions=snap_predictions,
         )
         ensemble_pred_df.to_csv(out_dir / "ensemble_test_predictions.csv", index=False)
-        ensemble_pred_df.to_csv(out_dir / "ensemble_holdout_predictions.csv", index=False)
         ensemble_members = ensemble_metrics.pop("fitted_members")
         ensemble_metrics_json = {k: v for k, v in ensemble_metrics.items()}
         pd.DataFrame([ensemble_metrics_json]).to_csv(
             final_dir / "ensemble_test_metrics.csv", index=False
-        )
-        pd.DataFrame([ensemble_metrics_json]).to_csv(
-            final_dir / "ensemble_holdout_metrics.csv", index=False
         )
 
         if not external_holdout_df.empty:
@@ -1527,7 +1515,6 @@ def train_classical(
                         "model": fitted_member,
                         "model_name": info["model_name"],
                         "feature_cols": feat_cols,
-                        "selected_features": feat_cols,
                         "validation_mae": float(
                             ensemble_top_rows.loc[
                                 ensemble_top_rows["model_name"] == info["model_name"],
@@ -1560,7 +1547,6 @@ def train_classical(
     bundle = {
         "model": best_estimator,
         "feature_cols": feat_cols,
-        "selected_features": feat_cols,
         "best_model_name": best_model_name,
         "best_params": best_params,
         "holdout_mae": test_metrics["holdout_mae"],
@@ -1695,7 +1681,6 @@ def train_classical(
         "validation_summary_df": validation_summary,
         "nested_results_df": results_df,
         "inner_search_df": inner_search_df,
-        "repeat_metrics_df": results_df,
         "train_oof_metrics": train_oof_metrics,
         "out_dir": str(out_dir),
         "bundle_path": str(bundle_path),

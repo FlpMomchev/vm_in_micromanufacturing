@@ -2,9 +2,9 @@
 
 Virtual metrology pipeline for micro-drilling depth prediction from acoustic sensing (airborne + structure-borne), with classical ML, deep learning, and multi-stage fusion.
 
-## Current Status (2026-03-29)
+## Current Status (2026-03-30)
 
-- The full pipeline is implemented end-to-end:
+- Full end-to-end pipeline:
   - split raw recordings into per-hole segments
   - extract modality-specific features
   - select features
@@ -13,8 +13,8 @@ Virtual metrology pipeline for micro-drilling depth prediction from acoustic sen
   - run inference
   - fuse classical + DL per modality
   - fuse modalities into final prediction
-- `vm-predict-fused` is available for one-shot production-style flow (`raw -> split -> infer -> fuse`).
-- Automated tests exist for data I/O/splitting, features, classical, and fusion modules.
+- `vm-predict-fused` handles one-shot production-style flow (`raw -> split -> infer -> fuse`).
+- Automated tests cover data I/O, features, classical, DL, and fusion modules.
 
 
 ## Repository Structure
@@ -141,7 +141,7 @@ Installed console scripts:
 - `vm-fuse`
 - `vm-predict-fused`
 
-## End-to-End Pipeline (Current)
+## End-to-End Pipeline
 
 ### 1) Split raw recordings into per-hole segments
 
@@ -150,7 +150,7 @@ Installed console scripts:
 vm-split batch --preset airborne_normalBand
 vm-split batch --preset structure
 
-# Single file example
+# Single file
 vm-split single \
   --input data/raw_data/air_borne/normalBand/<recording>.flac \
   --out-dir data/raw_data_extracted_splits/air/<recording> \
@@ -257,12 +257,16 @@ vm-fuse inter \
 ### 8) One-shot fused prediction from raw files
 
 ```bash
-vm-predict-fused --config configs/fusion.yaml
+vm-predict-fused batch --config configs/fusion.yaml
+
+# Single-recording mode (skip splitting), with optional ground-truth depth
+vm-predict-fused single --config configs/fusion.yaml --actual-depth-mm 0.750
 ```
 
-This command scans configured raw folders, splits new files, runs modality inference, fuses outputs, and writes run artifacts to `data/fusion_results/<timestamp>__<tag>/`.
+In `batch` mode, the command scans configured raw folders, splits new files, runs modality inference, fuses outputs, and writes run artifacts to `data/fusion_results/<timestamp>__<tag>/`.
+In `single` mode, splitting is skipped and inference runs directly on the raw files.
 
-Current run layout:
+Run output layout:
 
 ```text
 data/fusion_results/<timestamp>__<tag>/
@@ -271,24 +275,26 @@ data/fusion_results/<timestamp>__<tag>/
     dl_predictions.csv
     features_airborne.csv
     fusion_predictions.csv
+    fusion_predictions_long.csv
     <recording_stem>/segments_manifest.csv
   structure/
     classical_predictions.csv
     dl_predictions.csv
     features_structure.csv
     fusion_predictions.csv
+    fusion_predictions_long.csv
     <recording_stem>/segments_manifest.csv
   final/
     final_predictions.csv
-    batch_quality_report.json
+    final_predictions_long.csv
+    batch_quality_report.json        (batch mode)
+    apples_to_apples_report.json     (batch mode)
+    single_prediction_report.json    (single mode)
     setup_audit.json
-    apples_to_apples_report.json
     model_setup_locks/
       <timestamp>__<tag>_setup_lock.json
       LATEST_setup_lock.json
 ```
-
-Per-modality run outputs are intentionally CSV-only (plus segment manifests), while batch-level reports are grouped under `final/`.
 
 ## Fusion Architecture
 
@@ -341,6 +347,7 @@ Tests cover:
 - feature extraction modules
 - classical training/inference workflow
 - fusion logic and report serialization
+- fused prediction helpers and report generation
 
 ## Citation
 

@@ -9,9 +9,15 @@ import numpy as np
 import pandas as pd
 
 from scripts.final_prediction import (
+    _attach_actual_depth_mm_to_predictions_csv,
+    _bundle_from_pred_csv,
+    _canonical_long_record_keys,
+    _cleanup_single_model_predictions_csv,
     _copy_split_debug_plots_to_run_dir,
     _persist_model_setup_lock,
     _save_bundle_predictions_csv,
+    _single_prediction_report_payload,
+    build_parser,
 )
 from vm_micro.fusion.fuser import PredictionBundle
 
@@ -57,7 +63,9 @@ def test_save_bundle_predictions_csv_writes_parent_dirs(tmp_path: Path) -> None:
         "modality",
         "validation_mae",
         "depth_mm",
-        "residual",
+        "y_true",
+        "residual_mm",
+        "abs_residual_mm",
     ]
     assert len(df) == 2
 
@@ -121,3 +129,141 @@ def test_copy_split_debug_plots_to_run_dir_skips_missing_sources(tmp_path: Path)
         run_split_dir,
     )
     assert copied == {}
+
+
+def test_build_parser_parses_mode_and_optional_actual_depth_mm() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["single", "--actual-depth-mm", "0.875"])
+    assert args.mode == "single"
+    assert args.actual_depth_mm == 0.875
+
+
+def test_attach_actual_depth_mm_to_predictions_csv_overwrites_depth_and_residual(
+    tmp_path: Path,
+) -> None:
+    out_csv = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        {
+            "record_name": ["r1", "r2"],
+            "y_pred": [0.65, 0.80],
+            "depth_mm": [0.10, 0.10],
+            "residual": [-0.55, -0.70],
+        }
+    ).to_csv(out_csv, index=False)
+
+    _attach_actual_depth_mm_to_predictions_csv(out_csv, 0.75)
+
+    df = pd.read_csv(out_csv)
+    assert list(df["depth_mm"]) == [0.75, 0.75]
+    assert np.allclose(df["residual"].to_numpy(), np.array([0.10, -0.05]), atol=1e-12)
+
+
+def test_cleanup_single_model_predictions_csv_drops_legacy_duplicates(tmp_path: Path) -> None:
+    out_csv = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        {
+            "record_name": ["r1", "r2"],
+            "y_pred": [0.65, 0.80],
+            "depth_mm": [0.75, 0.75],
+            "y_true_depth": [0.75, 0.75],
+            "residual": [-0.10, 0.05],
+        }
+    ).to_csv(out_csv, index=False)
+
+    _cleanup_single_model_predictions_csv(out_csv)
+
+    df = pd.read_csv(out_csv)
+    assert "residual" not in df.columns
+    assert "y_true_depth" not in df.columns
+    assert {"y_true", "residual_mm", "abs_residual_mm"}.issubset(df.columns)
+
+
+def test_single_prediction_report_payload_contains_expected_sections(tmp_path: Path) -> None:
+    final_csv = tmp_path / "final" / "final_predictions.csv"
+    final_csv.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "record_name": ["rec_1"],
+            "y_pred": [0.82],
+            "sigma": [0.03],
+            "depth_mm": [0.75],
+            "residual": [0.07],
+        }
+    ).to_csv(final_csv, index=False)
+
+    payload = _single_prediction_report_payload(
+        run_dir=tmp_path,
+        final_predictions_csv=final_csv,
+        final_quality={
+            "predictions_csv": "final/final_predictions.csv",
+            "has_ground_truth": True,
+            "n_with_ground_truth": 1,
+            "mae_mm": 0.07,
+            "rmse_mm": 0.07,
+        },
+        batch_quality={
+            "models": {"airborne_dl": {"mae_mm": 0.08}},
+            "modality_fusions": {"airborne_ensemble": {"mae_mm": 0.07}},
+        },
+        actual_depth_mm=0.75,
+    )
+
+    assert payload["mode"] == "single"
+    assert payload["actual_depth_mm"] == 0.75
+    assert "models" in payload
+    assert "modality_fusions" in payload
+    assert payload["final_prediction"]["prediction_summary"]["n_predictions"] == 1
+    assert payload["final_prediction"]["predictions"][0]["record_name"] == "rec_1"
+
+
+def test_bundle_from_pred_csv_supports_fusion_and_record_key_modes(tmp_path: Path) -> None:
+    pred_csv = tmp_path / "pred.csv"
+    pd.DataFrame(
+        {
+            "record_name": [
+                "runA__seg001__step001__A1__depth0.750",
+                "runB__seg001__step001__A1__depth0.750",
+            ],
+            "y_pred": [0.7, 0.8],
+            "sigma": [0.01, 0.02],
+        }
+    ).to_csv(pred_csv, index=False)
+
+    b_fusion = _bundle_from_pred_csv(
+        pred_csv,
+        "airborne_ensemble",
+        fusion_mae=0.02,
+        fusion_mae_source="test",
+        record_key_mode="fusion",
+    )
+    b_record = _bundle_from_pred_csv(
+        pred_csv,
+        "airborne_ensemble",
+        fusion_mae=0.02,
+        fusion_mae_source="test",
+        record_key_mode="record",
+    )
+
+    assert b_fusion.metadata["record_key"].startswith("step+hole")
+    assert b_record.metadata["record_key"] == "record_name (full)"
+    assert b_fusion.record_names.tolist() == ["step=001__hole=A1", "step=001__hole=A1"]
+    assert b_record.record_names.tolist() == [
+        "runA__seg001__step001__A1__depth0.750",
+        "runB__seg001__step001__A1__depth0.750",
+    ]
+
+
+def test_canonical_long_record_keys_are_unique_and_run_indexed() -> None:
+    keys = _canonical_long_record_keys(
+        np.array(
+            [
+                "runB__seg001__step001__A1__depth0.750",
+                "runA__seg001__step001__A1__depth0.750",
+                "runA__seg002__step001__A1__depth0.750",
+            ]
+        )
+    )
+    assert len(keys) == 3
+    assert len(set(keys.tolist())) == 3
+    assert keys[0].startswith("run=002__")
+    assert keys[1].startswith("run=001__")

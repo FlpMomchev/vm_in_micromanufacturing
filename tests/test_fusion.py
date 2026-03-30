@@ -11,8 +11,11 @@ from vm_micro.fusion.fuser import (
     PredictionBundle,
     fuse_intra_modality,
     fuse_modalities,
+    hierarchical_sigma,
     load_bundle_from_csv,
+    normalize_weights,
     save_fusion_report,
+    weighted_sigma,
 )
 
 #
@@ -101,6 +104,30 @@ def test_intra_fusion_sigma_propagation():
     assert np.all(np.isfinite(fused.sigma))
 
 
+def test_weighted_sigma_matches_definition():
+    values = np.array([1.0, 3.0], dtype=np.float64)
+    weights = np.array([0.75, 0.25], dtype=np.float64)
+    mu = float(np.sum(weights * values))
+    expected = float(np.sqrt(np.sum(weights * (values - mu) ** 2)))
+    assert np.isclose(weighted_sigma(values, weights), expected, atol=1e-12)
+
+
+def test_hierarchical_sigma_matches_definition():
+    means = np.array([1.0, 3.0], dtype=np.float64)
+    sigmas = np.array([0.2, 0.4], dtype=np.float64)
+    weights = np.array([0.75, 0.25], dtype=np.float64)
+    mu = float(np.sum(weights * means))
+    expected = float(np.sqrt(np.sum(weights * (((means - mu) ** 2) + (sigmas**2)))))
+    assert np.isclose(hierarchical_sigma(means, sigmas, weights), expected, atol=1e-12)
+
+
+def test_normalize_weights_falls_back_to_equal_on_invalid():
+    out = normalize_weights(np.array([np.nan, 3.0], dtype=np.float64))
+    np.testing.assert_allclose(out, np.array([0.5, 0.5], dtype=np.float64), atol=1e-12)
+    out2 = normalize_weights(np.array([0.0, 3.0], dtype=np.float64))
+    np.testing.assert_allclose(out2, np.array([0.5, 0.5], dtype=np.float64), atol=1e-12)
+
+
 #
 # fuse_modalities (inter)
 #
@@ -121,6 +148,82 @@ def test_single_modality_passthrough():
     b = _make_bundle("airborne_ensemble", val_mae=0.040)
     final = fuse_modalities(b)
     np.testing.assert_array_equal(final.y_pred, b.y_pred)
+
+
+def test_intra_fusion_sigma_is_weighted_disagreement():
+    records = np.array(["r1", "r2"])
+    cls = PredictionBundle(
+        modality="airborne_classical",
+        record_names=records,
+        y_pred=np.array([1.0, 2.0]),
+        sigma=np.array([0.0, 0.0]),
+        validation_mae=0.1,
+    )
+    dl = PredictionBundle(
+        modality="airborne_dl",
+        record_names=records,
+        y_pred=np.array([3.0, 4.0]),
+        sigma=np.array([0.0, 0.0]),
+        validation_mae=0.2,
+    )
+    fused = fuse_intra_modality(cls, dl, "airborne_ensemble")
+
+    w = np.array([2.0 / 3.0, 1.0 / 3.0], dtype=np.float64)
+    expected_mu = w[0] * cls.y_pred + w[1] * dl.y_pred
+    expected_sigma = np.sqrt(
+        w[0] * (cls.y_pred - expected_mu) ** 2 + w[1] * (dl.y_pred - expected_mu) ** 2
+    )
+    np.testing.assert_allclose(fused.y_pred, expected_mu, atol=1e-12)
+    np.testing.assert_allclose(fused.sigma, expected_sigma, atol=1e-12)
+
+
+def test_final_sigma_propagates_modality_disagreement_and_internal_sigma():
+    records = np.array(["r1", "r2"])
+    air = PredictionBundle(
+        modality="airborne_ensemble",
+        record_names=records,
+        y_pred=np.array([1.0, 2.0]),
+        sigma=np.array([0.1, 0.2]),
+        validation_mae=0.1,
+    )
+    st = PredictionBundle(
+        modality="structure_ensemble",
+        record_names=records,
+        y_pred=np.array([3.0, 0.0]),
+        sigma=np.array([0.3, 0.4]),
+        validation_mae=0.2,
+    )
+    final = fuse_modalities(air, st)
+
+    w = np.array([2.0 / 3.0, 1.0 / 3.0], dtype=np.float64)
+    expected_mu = w[0] * air.y_pred + w[1] * st.y_pred
+    expected_sigma = np.sqrt(
+        w[0] * (((air.y_pred - expected_mu) ** 2) + air.sigma**2)
+        + w[1] * (((st.y_pred - expected_mu) ** 2) + st.sigma**2)
+    )
+    np.testing.assert_allclose(final.y_pred, expected_mu, atol=1e-12)
+    np.testing.assert_allclose(final.sigma, expected_sigma, atol=1e-12)
+
+
+def test_missing_member_predictions_are_ignored_rowwise():
+    records = np.array(["r1", "r2"])
+    cls = PredictionBundle(
+        modality="airborne_classical",
+        record_names=records,
+        y_pred=np.array([1.0, np.nan]),
+        sigma=np.array([0.0, 0.0]),
+        validation_mae=0.1,
+    )
+    dl = PredictionBundle(
+        modality="airborne_dl",
+        record_names=records,
+        y_pred=np.array([3.0, 5.0]),
+        sigma=np.array([0.0, 0.0]),
+        validation_mae=0.2,
+    )
+    fused = fuse_intra_modality(cls, dl, "airborne_ensemble")
+    np.testing.assert_allclose(fused.y_pred, np.array([5.0 / 3.0, 5.0]), atol=1e-12)
+    np.testing.assert_allclose(fused.sigma, np.array([2.0 * np.sqrt(2.0) / 3.0, 0.0]), atol=1e-12)
 
 
 #

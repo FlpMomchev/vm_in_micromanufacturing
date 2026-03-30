@@ -1,15 +1,9 @@
-"""vm-predict-fused - One-shot fused inference from new raw recordings.
+"""vm-predict-fused -- One-shot fused inference from new raw recordings.
 
-This script is designed as the first backend-friendly entrypoint:
-- watches a raw input folder (scan on demand)
-- splits whole recordings into segments
-- runs per-modality inference (classical + DL)
-- fuses predictions (intra + inter)
-- writes one tidy output folder:
-  - modality folders with CSV artifacts (+ segment manifests)
-  - `final/` with batch-level JSON reports and final fused CSV
+Workflow: scan raw folder -> split -> extract features -> infer (classical + DL)
+-> fuse intra-modality -> fuse inter-modality -> write output folder.
 
-Config-first: see ``configs/fusion.yaml``.
+Config-driven: see ``configs/fusion.yaml``.
 """
 
 from __future__ import annotations
@@ -21,7 +15,7 @@ import re
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +30,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from vm_micro.classical.inference import infer_classical
-from vm_micro.data.manifest import load_doe, try_parse_depth_mm
+from vm_micro.data.manifest import extract_recording_root, load_doe, try_parse_depth_mm
 from vm_micro.data.splitter import process_one_file
 from vm_micro.features.airborne import (
     DEFAULT_FILE_GLOB as AIRBORNE_DEFAULT_FILE_GLOB,
@@ -67,11 +61,9 @@ from vm_micro.utils import apply_overrides, get_logger, load_config
 logger = get_logger(__name__)
 
 
-@dataclass
-class RawFile:
-    path: Path
-    stem: str
-    mtime_ns: int
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -80,22 +72,57 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run fused prediction on new raw recordings (split->infer->fuse).",
     )
     p.add_argument("--config", default="configs/fusion.yaml")
-    p.add_argument("--out-dir", default=None, help="Override run.out_dir for this execution.")
+    p.add_argument("--out-dir", default=None, help="Override run.out_dir.")
     p.add_argument(
         "--only",
         default="both",
         choices=["both", "airborne", "structure"],
         help="Limit processing to one modality.",
     )
+    p.add_argument("--force", action="store_true", help="Re-process already-processed files.")
     p.add_argument(
-        "--force",
-        action="store_true",
-        help="Re-process files even if present in the state file.",
+        "mode",
+        choices=["batch", "single"],
+        help="'batch' splits then infers; 'single' skips splitting.",
     )
     p.add_argument(
-        "override", nargs="*", help="YAML config overrides, e.g. --models.airborne.dl.device=cpu"
+        "--actual-depth-mm",
+        type=float,
+        default=None,
+        help="Optional ground-truth depth (mm) for MAE/RMSE reporting.",
     )
+    p.add_argument("override", nargs="*", help="YAML config overrides.")
     return p
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RawFile:
+    path: Path
+    stem: str
+    mtime_ns: int
+
+
+@dataclass
+class ModalityResult:
+    """Outputs from processing a single modality."""
+
+    fused_bundle: PredictionBundle | None = None
+    fused_long_bundle: PredictionBundle | None = None
+    model_quality: dict[str, Any] = field(default_factory=dict)
+    fusion_quality: dict[str, Any] = field(default_factory=dict)
+    model_apples: dict[str, Any] = field(default_factory=dict)
+    model_setups: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
 
 
 def _now_tag() -> str:
@@ -115,10 +142,14 @@ def _save_state(path: Path, state: dict[str, Any]) -> None:
         json.dump(state, fh, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# Scanning and DOE
+# ---------------------------------------------------------------------------
+
+
 def _scan_raw(raw_dir: Path, file_glob: str) -> list[RawFile]:
-    paths = sorted(raw_dir.glob(file_glob))
     out: list[RawFile] = []
-    for p in paths:
+    for p in sorted(raw_dir.glob(file_glob)):
         try:
             st = p.stat()
         except FileNotFoundError:
@@ -127,13 +158,12 @@ def _scan_raw(raw_dir: Path, file_glob: str) -> list[RawFile]:
     return out
 
 
-def _dummy_doe(expected_segments: int) -> pd.DataFrame:
-    # Use Step 1..N so segment stems always include a step index.
+def _dummy_doe(n: int) -> pd.DataFrame:
     return pd.DataFrame(
         {
-            "Step": list(range(1, expected_segments + 1)),
-            "HoleID": ["NA"] * expected_segments,
-            "Depth_mm": [None] * expected_segments,
+            "Step": list(range(1, n + 1)),
+            "HoleID": ["NA"] * n,
+            "Depth_mm": [None] * n,
         }
     )
 
@@ -141,87 +171,57 @@ def _dummy_doe(expected_segments: int) -> pd.DataFrame:
 def _expected_map(cfg: dict[str, Any]) -> tuple[dict[str, int], pd.DataFrame | None]:
     exp = cfg.get("splitting", {}).get("expected_segments", {})
     default = int(exp.get("default", 25))
-    map_xlsx = exp.get("map_xlsx", None)
+    map_xlsx = exp.get("map_xlsx")
     doe_sheet = str(exp.get("doe_sheet", "DOE_run_order"))
-
-    mapping: dict[str, int] = {}
     doe_df: pd.DataFrame | None = None
 
     if map_xlsx:
         p = Path(str(map_xlsx))
         if p.suffix.lower() not in {".xlsx", ".xlsm", ".xls"}:
-            logger.warning(
-                "splitting.expected_segments.map_xlsx must be an Excel file. Got %s, ignoring.",
-                map_xlsx,
-            )
+            logger.warning("map_xlsx must be Excel. Got %s, ignoring.", map_xlsx)
         else:
             try:
                 doe_df = load_doe(map_xlsx, sheet_name=doe_sheet)
             except Exception as exc:
-                logger.warning(
-                    "Failed to load DOE workbook %s (sheet=%s): %s. "
-                    "Falling back to configured default=%d.",
-                    map_xlsx,
-                    doe_sheet,
-                    exc,
-                    default,
-                )
+                logger.warning("Failed to load DOE %s: %s. default=%d.", map_xlsx, exc, default)
             else:
-                doe_rows = int(len(doe_df))
-                if doe_rows <= 0:
-                    logger.warning(
-                        "DOE workbook %s (sheet=%s) is empty. "
-                        "Falling back to configured default=%d.",
-                        map_xlsx,
-                        doe_sheet,
-                        default,
-                    )
-                else:
-                    if default != doe_rows:
-                        logger.info(
-                            "Overriding splitting.expected_segments.default=%d with DOE row count=%d "
-                            "from %s (sheet=%s).",
-                            default,
-                            doe_rows,
-                            map_xlsx,
-                            doe_sheet,
-                        )
-                    default = doe_rows
+                if len(doe_df) > 0:
+                    default = len(doe_df)
 
-    mapping["_default"] = default
-    return mapping, doe_df
+    return {"_default": default}, doe_df
 
 
 def _resolve_expected(mapping: dict[str, int], stem: str) -> int:
     return int(mapping.get(stem, mapping.get("_default", 25)))
 
 
-def _doe_for_file(doe_template: pd.DataFrame | None, expected_segments: int) -> pd.DataFrame:
-    expected_segments = int(expected_segments)
+def _doe_for_file(doe_template: pd.DataFrame | None, n: int) -> pd.DataFrame:
+    n = int(n)
     if doe_template is None:
-        return _dummy_doe(expected_segments)
-
-    doe_base = doe_template.reset_index(drop=True).copy()
-    n_rows = len(doe_base)
-    if expected_segments <= n_rows:
-        return doe_base.iloc[:expected_segments].reset_index(drop=True).copy()
-
-    extra_n = expected_segments - n_rows
-    extras = pd.DataFrame(
+        return _dummy_doe(n)
+    base = doe_template.reset_index(drop=True).copy()
+    if n <= len(base):
+        return base.iloc[:n].reset_index(drop=True).copy()
+    extra = pd.DataFrame(
         {
-            "Step": list(range(n_rows + 1, expected_segments + 1)),
-            "HoleID": ["NA"] * extra_n,
-            "Depth_mm": [None] * extra_n,
+            "Step": list(range(len(base) + 1, n + 1)),
+            "HoleID": ["NA"] * (n - len(base)),
+            "Depth_mm": [None] * (n - len(base)),
         }
     )
-    return pd.concat([doe_base, extras], ignore_index=True, sort=False)
+    return pd.concat([base, extra], ignore_index=True, sort=False)
+
+
+# ---------------------------------------------------------------------------
+# Feature extraction helpers
+# ---------------------------------------------------------------------------
 
 
 def _ensure_feature_cols(df: pd.DataFrame, required: list[str]) -> pd.DataFrame:
     out = df.copy()
-    missing = [c for c in required if c not in out.columns]
-    for c in missing:
-        out[c] = np.nan
+    for c in required:
+        if c not in out.columns:
+            out[c] = np.nan
     return out
 
 
@@ -233,25 +233,47 @@ def _extract_for_roots(
     cfg: dict[str, Any],
     file_glob: str | None,
     n_workers: int | None,
+    grouped_by_root: bool = True,
 ) -> pd.DataFrame:
-    frames: list[pd.DataFrame] = []
-    for root in sorted(roots):
-        root_dir = segments_root / root
-        if not root_dir.exists():
-            logger.warning(
-                "Segments folder missing for root %s under %s; skipping.", root, segments_root
+    if grouped_by_root:
+        frames: list[pd.DataFrame] = []
+        for root in sorted(roots):
+            root_dir = segments_root / root
+            if not root_dir.exists():
+                logger.warning("Segments missing for %s; skipping.", root)
+                continue
+            frames.append(
+                extractor(root_dir, cfg, out_csv=None, file_glob=file_glob, n_workers=n_workers)
             )
+        if not frames:
+            raise FileNotFoundError(
+                f"No segment folders under {segments_root} for roots={sorted(roots)}"
+            )
+        return pd.concat(frames, ignore_index=True)
+
+    if not segments_root.exists():
+        raise FileNotFoundError(f"Input directory does not exist: {segments_root}")
+    df = extractor(segments_root, cfg, out_csv=None, file_glob=file_glob, n_workers=n_workers)
+    if "record_name" not in df.columns and "recording_root" not in df.columns:
+        raise KeyError("Feature extraction must produce 'recording_root' or 'record_name'.")
+
+    for col in ("record_name", "recording_root"):
+        if col not in df.columns:
             continue
-        frames.append(
-            extractor(root_dir, cfg, out_csv=None, file_glob=file_glob, n_workers=n_workers)
-        )
+        out = df[df[col].astype(str).isin(roots)].copy()
+        if not out.empty:
+            return out.reset_index(drop=True)
+    if "record_name" in df.columns:
+        out = df[df["record_name"].astype(str).map(extract_recording_root).isin(roots)].copy()
+        if not out.empty:
+            return out.reset_index(drop=True)
 
-    if not frames:
-        raise FileNotFoundError(
-            f"No segment folders found under {segments_root} for roots={sorted(roots)}"
-        )
+    raise FileNotFoundError(f"No files under {segments_root} for roots={sorted(roots)}")
 
-    return pd.concat(frames, ignore_index=True)
+
+# ---------------------------------------------------------------------------
+# DL inference
+# ---------------------------------------------------------------------------
 
 
 def _h5_file_info(path: Path, data_key: str, time_key: str) -> dict[str, Any]:
@@ -277,13 +299,16 @@ def _build_unlabeled_file_df(
     h5_data_key: str,
     h5_time_key: str,
     include_recording_roots: set[str] | None = None,
+    parse_depth_from_filename: bool = True,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for p in sorted(data_dir.glob(file_glob)):
         if p.is_dir():
             continue
         recording_root = p.stem.split("__seg")[0] if "__seg" in p.stem else p.stem
-        if include_recording_roots is not None and recording_root not in include_recording_roots:
+        if include_recording_roots is not None and (
+            recording_root not in include_recording_roots and p.stem not in include_recording_roots
+        ):
             continue
         if p.suffix.lower() in {".flac", ".wav"}:
             info = sf.info(str(p))
@@ -295,7 +320,6 @@ def _build_unlabeled_file_df(
             }
         else:
             meta = _h5_file_info(p, h5_data_key, h5_time_key)
-
         rows.append(
             {
                 "file_id": len(rows),
@@ -303,9 +327,9 @@ def _build_unlabeled_file_df(
                 "record_name": p.stem,
                 "stem": p.stem,
                 "file_name": p.name,
-                # If depth is encoded in the filename (e.g. "__depth0.750"),
-                # retain it so per-run MAE can be computed for fusion weights.
-                "depth_mm": try_parse_depth_mm(p.stem),
+                "depth_mm": try_parse_depth_mm(p.stem)
+                if parse_depth_from_filename
+                else float("nan"),
                 "class_idx": -1,
                 "recording_root": recording_root,
                 "parent_dir": p.parent.name,
@@ -314,7 +338,7 @@ def _build_unlabeled_file_df(
             }
         )
     if not rows:
-        raise FileNotFoundError(f"No files found under {data_dir} matching {file_glob}")
+        raise FileNotFoundError(f"No files under {data_dir} matching {file_glob}")
     return pd.DataFrame(rows)
 
 
@@ -329,6 +353,7 @@ def _infer_dl_on_segments(
     h5_data_key: str,
     h5_time_key: str,
     include_recording_roots: set[str] | None = None,
+    parse_depth_from_filename: bool = True,
 ) -> pd.DataFrame:
     import torch
 
@@ -342,26 +367,27 @@ def _infer_dl_on_segments(
     if final_dir.exists() and (final_dir / "best_model.pt").exists():
         model_dir = final_dir
     elif not (model_dir / "best_model.pt").exists():
-        raise FileNotFoundError(f"No best_model.pt found under {model_dir}")
+        raise FileNotFoundError(f"No best_model.pt under {model_dir}")
 
     with open(model_dir / "config.json", "r", encoding="utf-8") as fh:
         payload = json.load(fh)
     cfg = TrainConfig.from_json_dict(payload)
     if batch_size is not None:
         cfg.batch_size = int(batch_size)
-    effective_file_glob = str(file_glob or cfg.file_glob)
+    effective_glob = str(file_glob or cfg.file_glob)
     cfg.data_dir = str(segments_dir)
-    cfg.file_glob = effective_file_glob
+    cfg.file_glob = effective_glob
 
     dev = choose_device(device if device != "auto" else cfg.device)
     logger.info("DL inference device: %s", dev)
 
     file_df = _build_unlabeled_file_df(
         segments_dir,
-        effective_file_glob,
+        effective_glob,
         h5_data_key=h5_data_key,
         h5_time_key=h5_time_key,
         include_recording_roots=include_recording_roots,
+        parse_depth_from_filename=parse_depth_from_filename,
     )
     file_df = attach_step_idx_if_possible(file_df)
 
@@ -377,80 +403,35 @@ def _infer_dl_on_segments(
     model.eval()
 
     ds = WaveformWindowDataset(
-        file_df, cfg, training=False, h5_data_key=h5_data_key, h5_time_key=h5_time_key
+        file_df,
+        cfg,
+        training=False,
+        h5_data_key=h5_data_key,
+        h5_time_key=h5_time_key,
     )
     loader = make_loader(ds, cfg, shuffle=False)
-
     try:
         window_df = predict_loader(model, loader, dev, cfg)
     except PermissionError as exc:
-        logger.warning(
-            "DL DataLoader multiprocessing unavailable (%s). Retrying with num_workers=0.",
-            exc,
-        )
+        logger.warning("Multiprocessing unavailable (%s). Retrying num_workers=0.", exc)
         cfg.num_workers = 0
         loader = make_loader(ds, cfg, shuffle=False)
         window_df = predict_loader(model, loader, dev, cfg)
-    file_pred = aggregate_file_predictions(window_df, file_df, cfg, class_to_depth)
 
+    file_pred = aggregate_file_predictions(window_df, file_df, cfg, class_to_depth)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     file_pred.to_csv(out_csv, index=False)
     return file_pred
 
 
-def _bundle_from_pred_csv(
-    csv_path: Path,
-    modality: str,
-    *,
-    fusion_mae: float,
-    fusion_mae_source: str,
-) -> PredictionBundle:
-    df = pd.read_csv(csv_path)
-    sigma = df["sigma"].to_numpy() if "sigma" in df.columns else np.zeros(len(df), dtype=np.float64)
-    y_true, y_true_col = _extract_y_true_from_prediction_df(df)
-
-    if "record_name" not in df.columns:
-        raise KeyError(f"Expected 'record_name' column in {csv_path}, got {list(df.columns)}")
-    fusion_keys = df["record_name"].astype(str).map(_fusion_key_from_record_name)
-
-    metadata: dict[str, Any] = {
-        "reference_mae_source": fusion_mae_source,
-        "record_key": "step+hole (parsed from record_name)",
-    }
-    if y_true_col is not None:
-        metadata["batch_ground_truth_column"] = y_true_col
-
-    return PredictionBundle(
-        modality=modality,
-        record_names=fusion_keys.to_numpy(),
-        y_pred=df["y_pred"].to_numpy(dtype=np.float64),
-        sigma=sigma,
-        validation_mae=float(fusion_mae),
-        y_true=y_true,
-        metadata=metadata,
-    )
-
-
-def _extract_y_true_from_prediction_df(df: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
-    for col in ("depth_mm", "y_true_depth", "y_true"):
-        if col not in df.columns:
-            continue
-        vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
-        if np.isfinite(vals).any():
-            return vals, col
-    return None, None
+# ---------------------------------------------------------------------------
+# Record-key helpers
+# ---------------------------------------------------------------------------
 
 
 def _fusion_key_from_record_name(record_name: str) -> str:
-    """Modality-agnostic key for inter-fusion alignment (based on DOE identity).
-
-    Segment filenames are canonical:
-      {stem}__seg{NNN}__step{SSS}__{HOLE}__depth{D.DDD}
-
-    Raw stems can differ between modalities; (step, hole) should match.
-    """
-    s = str(record_name)
-    parts = s.split("__")
+    """Modality-agnostic key for inter-fusion alignment (step + hole from DOE)."""
+    parts = str(record_name).split("__")
     step_idx: int | None = None
     hole: str | None = None
     for i, token in enumerate(parts):
@@ -462,9 +443,8 @@ def _fusion_key_from_record_name(record_name: str) -> str:
             if i + 1 < len(parts):
                 hole = parts[i + 1]
             break
-
     if step_idx is None and hole is None:
-        return s
+        return str(record_name)
     if step_idx is None:
         return f"hole={hole}"
     if hole is None:
@@ -472,597 +452,356 @@ def _fusion_key_from_record_name(record_name: str) -> str:
     return f"step={step_idx:03d}__hole={hole}"
 
 
-def _classical_model_root_from_bundle_path(bundle_path: Path) -> Path:
-    p = Path(bundle_path)
-    if p.parent.name == "final_model":
-        return p.parent.parent
-    return p.parent
+def _canonical_long_record_keys(record_names: np.ndarray) -> np.ndarray:
+    """Canonical cross-modality keys for long fusion (run-index + step/hole)."""
+    names = [str(x) for x in np.asarray(record_names).tolist()]
+    roots = [extract_recording_root(n) for n in names]
+    root_rank = {root: i + 1 for i, root in enumerate(sorted(set(roots)))}
+    base_keys = [
+        f"run={root_rank[root]:03d}__{_fusion_key_from_record_name(name)}"
+        for name, root in zip(names, roots)
+    ]
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for base in base_keys:
+        idx = seen.get(base, 0) + 1
+        seen[base] = idx
+        out.append(base if idx == 1 else f"{base}__occ{idx:03d}")
+    return np.asarray(out)
 
 
-def _dl_model_root(model_dir: Path) -> Path:
-    p = Path(model_dir)
-    if p.name == "final_model":
-        return p.parent
-    if (p / "final_model").exists():
-        return p
-    return p
+# ---------------------------------------------------------------------------
+# Prediction bundle I/O
+# ---------------------------------------------------------------------------
 
 
-def _config_mae_fallback(cfg_node: dict[str, Any]) -> float | None:
-    raw = cfg_node.get("fusion_mae_fallback", cfg_node.get("validation_mae", None))
-    if raw is None:
-        return None
-    return float(raw)
+def _extract_y_true(df: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
+    for col in ("depth_mm", "y_true_depth", "y_true"):
+        if col not in df.columns:
+            continue
+        vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
+        if np.isfinite(vals).any():
+            return vals, col
+    return None, None
 
 
-def _read_classical_single_holdout_mae(bundle_path: Path) -> float:
-    model_root = _classical_model_root_from_bundle_path(bundle_path)
-    metrics_path = model_root / "final_model" / "test_metrics.csv"
-    if not metrics_path.exists():
-        raise FileNotFoundError(f"Missing classical test metrics: {metrics_path}")
-
-    df = pd.read_csv(metrics_path)
-    if df.empty:
-        raise ValueError(f"Empty test metrics file: {metrics_path}")
-    if "holdout_mae_raw" not in df.columns:
-        raise KeyError(f"'holdout_mae_raw' column missing in {metrics_path}")
-
-    maes = pd.to_numeric(df["holdout_mae_raw"], errors="coerce").to_numpy(dtype=np.float64)
-    maes = maes[np.isfinite(maes)]
-    if maes.size == 0:
-        raise ValueError(f"No finite holdout_mae_raw values in {metrics_path}")
-
-    mae = float(maes[0])
-    logger.info(
-        "Using classical single-model holdout raw MAE %.6f from %s",
-        mae,
-        metrics_path,
+def _bundle_from_pred_csv(
+    csv_path: Path,
+    modality: str,
+    *,
+    fusion_mae: float,
+    fusion_mae_source: str,
+    record_key_mode: str = "fusion",
+) -> PredictionBundle:
+    df = pd.read_csv(csv_path)
+    has_real_sigma = "sigma" in df.columns
+    sigma = (
+        df["sigma"].to_numpy(dtype=np.float64)
+        if has_real_sigma
+        else np.zeros(len(df), dtype=np.float64)
     )
-    return mae
+    y_true, y_true_col = _extract_y_true(df)
 
+    if "record_name" not in df.columns:
+        raise KeyError(f"Expected 'record_name' in {csv_path}, got {list(df.columns)}")
 
-def _read_classical_ensemble_holdout_mae(bundle_path: Path) -> float:
-    model_root = _classical_model_root_from_bundle_path(bundle_path)
-    pred_path = model_root / "ensemble_test_predictions.csv"
-    if not pred_path.exists():
-        raise FileNotFoundError(f"Missing ensemble holdout predictions: {pred_path}")
-
-    df = pd.read_csv(pred_path)
-    if "y_pred_raw" not in df.columns:
-        raise KeyError(f"'y_pred_raw' column missing in {pred_path}")
-
-    if "y_true" in df.columns:
-        target_col = "y_true"
-    elif "depth_mm" in df.columns:
-        target_col = "depth_mm"
+    if record_key_mode == "fusion":
+        record_keys = df["record_name"].astype(str).map(_fusion_key_from_record_name)
+        record_key_desc = "step+hole (parsed from record_name)"
+    elif record_key_mode == "record":
+        record_keys = df["record_name"].astype(str)
+        record_key_desc = "record_name (full)"
     else:
-        raise KeyError(f"Neither 'y_true' nor 'depth_mm' column found in {pred_path}")
+        raise ValueError(f"Unsupported record_key_mode={record_key_mode!r}")
 
-    y_true = pd.to_numeric(df[target_col], errors="coerce").to_numpy(dtype=np.float64)
-    y_pred_raw = pd.to_numeric(df["y_pred_raw"], errors="coerce").to_numpy(dtype=np.float64)
-    mask = np.isfinite(y_true) & np.isfinite(y_pred_raw)
-    if not np.any(mask):
-        raise ValueError(f"No finite (y_true, y_pred_raw) pairs in {pred_path}")
-
-    mae = float(np.mean(np.abs(y_true[mask] - y_pred_raw[mask])))
-    logger.info(
-        "Using classical ensemble holdout raw MAE %.6f computed from %s (%s vs y_pred_raw)",
-        mae,
-        pred_path,
-        target_col,
-    )
-    return mae
-
-
-def _read_classical_fusion_mae(
-    bundle_path: Path,
-    bundle: dict[str, Any],
-) -> float:
-    if "model" in bundle:
-        return _read_classical_single_holdout_mae(bundle_path)
-    if "members" in bundle:
-        return _read_classical_ensemble_holdout_mae(bundle_path)
-    raise KeyError(
-        "Unsupported classical bundle format. Expected 'model' or 'members'. "
-        f"Available keys: {list(bundle.keys())}"
-    )
-
-
-def _read_dl_fusion_mae_from_summary(model_dir: Path) -> tuple[float, str]:
-    model_root = _dl_model_root(model_dir)
-    summary_path = model_root / "repeat_metrics_summary.json"
-    if not summary_path.exists():
-        raise FileNotFoundError(f"Missing DL repeat summary: {summary_path}")
-
-    with open(summary_path, "r", encoding="utf-8") as fh:
-        payload = json.load(fh)
-
-    source_key = (
-        "mean_test_mae" if payload.get("mean_test_mae", None) is not None else "mean_val_mae"
-    )
-    mae = payload.get(source_key, None)
-    if mae is None:
-        raise KeyError(f"Neither 'mean_test_mae' nor 'mean_val_mae' found in {summary_path}")
-    mae = float(mae)
-    if not np.isfinite(mae):
-        raise ValueError(f"Non-finite {source_key} in {summary_path}: {mae}")
-
-    logger.info(
-        "Using DL fusion MAE %.6f from %s (%s)",
-        mae,
-        summary_path,
-        source_key,
-    )
-    return mae, source_key
-
-
-def _resolve_classical_fusion_mae(
-    *,
-    bundle_path: Path,
-    bundle: dict[str, Any],
-    cfg_mae_fallback: float | None,
-) -> tuple[float, str]:
-    try:
-        mae = _read_classical_fusion_mae(bundle_path, bundle)
-        if "model" in bundle:
-            return mae, "final_model/test_metrics.csv.holdout_mae_raw"
-        if "members" in bundle:
-            return mae, "ensemble_test_predictions.csv.y_pred_raw"
-        return mae, "bundle"
-    except Exception as exc:
-        if cfg_mae_fallback is not None:
-            logger.warning(
-                "Falling back to config classical fusion_mae_fallback=%s because MAE lookup failed: %s",
-                cfg_mae_fallback,
-                exc,
-            )
-            return float(cfg_mae_fallback), "config.fusion_mae_fallback"
-        raise
-
-
-def _resolve_dl_fusion_mae(
-    *,
-    model_dir: Path,
-    cfg_mae_fallback: float | None,
-) -> tuple[float, str]:
-    try:
-        mae, source_key = _read_dl_fusion_mae_from_summary(model_dir)
-        return mae, f"repeat_metrics_summary.json.{source_key}"
-    except Exception as exc:
-        if cfg_mae_fallback is not None:
-            logger.warning(
-                "Falling back to config DL fusion_mae_fallback=%s because MAE lookup failed: %s",
-                cfg_mae_fallback,
-                exc,
-            )
-            return float(cfg_mae_fallback), "config.fusion_mae_fallback"
-        raise
-
-
-def _safe_rel(path: Path, base: Path) -> str:
-    try:
-        return str(path.relative_to(base))
-    except Exception:
-        return str(path)
-
-
-def _quality_entry(
-    bundle: PredictionBundle, *, predictions_csv: Path, run_dir: Path
-) -> dict[str, Any]:
-    return {
-        "predictions_csv": _safe_rel(predictions_csv, run_dir),
-        **bundle_batch_metrics(bundle),
+    metadata: dict[str, Any] = {
+        "reference_mae_source": fusion_mae_source,
+        "record_key": record_key_desc,
+        "has_real_sigma": bool(has_real_sigma),
     }
+    if y_true_col is not None:
+        metadata["batch_ground_truth_column"] = y_true_col
+
+    return PredictionBundle(
+        modality=modality,
+        record_names=record_keys.to_numpy(),
+        y_pred=df["y_pred"].to_numpy(dtype=np.float64),
+        sigma=sigma,
+        validation_mae=float(fusion_mae),
+        y_true=y_true,
+        metadata=metadata,
+    )
+
+
+def _confidence_labels(sigma_vals: np.ndarray) -> np.ndarray:
+    sig = np.asarray(sigma_vals, dtype=np.float64)
+    labels = np.full(sig.shape, None, dtype=object)
+    valid = np.isfinite(sig)
+    labels[valid & (sig < 0.05)] = "high"
+    labels[valid & (sig >= 0.05) & (sig < 0.15)] = "medium"
+    labels[valid & (sig >= 0.15)] = "low"
+    return labels
 
 
 def _save_bundle_predictions_csv(bundle: PredictionBundle, out_csv: Path) -> Path:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    bundle.to_dataframe().to_csv(out_csv, index=False)
+    df = bundle.to_dataframe()
+    y_pred = pd.to_numeric(df.get("y_pred", pd.Series(dtype=np.float64)), errors="coerce")
+
+    y_true_series: pd.Series | None = None
+    for col in ("y_true", "depth_mm", "y_true_depth"):
+        if col not in df.columns:
+            continue
+        cand = pd.to_numeric(df[col], errors="coerce")
+        if np.isfinite(cand.to_numpy(dtype=np.float64)).any():
+            y_true_series = cand
+            break
+
+    if y_true_series is not None:
+        df["y_true"] = y_true_series
+        residual = y_pred - y_true_series
+        df["residual_mm"] = residual
+        df["abs_residual_mm"] = np.abs(residual)
+    else:
+        df = df.drop(
+            columns=[c for c in ("y_true", "residual_mm", "abs_residual_mm") if c in df.columns],
+        )
+
+    has_real_sigma = bool(bundle.metadata.get("has_real_sigma", False))
+    if has_real_sigma and "sigma" in df.columns:
+        sigma_vals = pd.to_numeric(df["sigma"], errors="coerce").to_numpy(dtype=np.float64)
+        df["confidence_label"] = _confidence_labels(sigma_vals)
+        if y_true_series is not None and "abs_residual_mm" in df.columns:
+            abs_res = pd.to_numeric(
+                df["abs_residual_mm"],
+                errors="coerce",
+            ).to_numpy(dtype=np.float64)
+            valid = np.isfinite(abs_res) & np.isfinite(sigma_vals) & (sigma_vals > 0)
+            z_abs = np.full(len(df), np.nan, dtype=np.float64)
+            z_abs[valid] = abs_res[valid] / sigma_vals[valid]
+            within_1 = np.full(len(df), None, dtype=object)
+            within_2 = np.full(len(df), None, dtype=object)
+            within_1[valid] = abs_res[valid] <= sigma_vals[valid]
+            within_2[valid] = abs_res[valid] <= (2.0 * sigma_vals[valid])
+            df["z_abs"] = z_abs
+            df["within_1sigma"] = within_1
+            df["within_2sigma"] = within_2
+    else:
+        df = df.drop(
+            columns=[
+                c
+                for c in ("z_abs", "within_1sigma", "within_2sigma", "confidence_label")
+                if c in df.columns
+            ],
+        )
+
+    if bundle.modality == "final_fusion":
+        for col in ("sigma_airborne_mm", "sigma_structure_mm", "sigma_between_modalities_mm"):
+            vals = bundle.metadata.get(col)
+            if isinstance(vals, list) and len(vals) == len(df):
+                df[col] = vals
+
+    # Drop redundant columns
+    if "residual_mm" in df.columns and "residual" in df.columns:
+        df = df.drop(columns=["residual"])
+    if "y_true_depth" in df.columns and ("depth_mm" in df.columns or "y_true" in df.columns):
+        df = df.drop(columns=["y_true_depth"])
+
+    df.to_csv(out_csv, index=False)
     return out_csv
 
 
-def _copy_split_debug_plots_to_run_dir(
-    summary: dict[str, Any], run_split_dir: Path
-) -> dict[str, str]:
-    """Copy splitter debug plots next to a run-specific split manifest."""
-    run_split_dir.mkdir(parents=True, exist_ok=True)
-    copied: dict[str, str] = {}
-    for summary_key in ("debug_core", "debug_padded"):
-        raw_src = summary.get(summary_key)
-        if not raw_src:
+def _cleanup_single_model_predictions_csv(predictions_csv: Path) -> None:
+    """Normalise a single-model predictions CSV: drop sigma, add y_true/residual_mm."""
+    if not predictions_csv.exists():
+        return
+    df = pd.read_csv(predictions_csv)
+    if df.empty:
+        return
+
+    df = df.drop(columns=["sigma"], errors="ignore")
+
+    y_true_series: pd.Series | None = None
+    for col in ("y_true", "depth_mm", "y_true_depth"):
+        if col not in df.columns:
             continue
-        src = Path(str(raw_src))
-        if not src.exists():
-            logger.warning("Missing split debug plot (%s): %s", summary_key, src)
-            continue
-        dst = run_split_dir / src.name
-        if src.resolve() != dst.resolve():
-            shutil.copy2(src, dst)
-        copied[summary_key] = str(dst)
-    return copied
-
-
-def _resolve_local_path(path_str: str | None) -> Path | None:
-    if not path_str:
-        return None
-    p = Path(path_str)
-    return p if p.is_absolute() else Path.cwd() / p
-
-
-def _normalise_structure_extractor(raw: Any) -> str:
-    key = str(raw if raw is not None else "v1").strip().lower()
-    if key == "extensive":
-        return "v2"
-    if key in {"v1", "v2"}:
-        return key
-    return "v1"
-
-
-def _resolve_classical_training_features_csv_path(bundle_path: Path) -> tuple[Path | None, str]:
-    model_root = _classical_model_root_from_bundle_path(bundle_path)
-    run_cfg = _safe_read_json(model_root / "run_config.json")
-    best_meta = _safe_read_json(model_root / "final_model" / "best_model_metadata.json")
-
-    candidates: list[tuple[str, Path | None]] = [
-        (
-            "best_model_metadata.features_csv",
-            _resolve_local_path(str(best_meta.get("features_csv")))
-            if best_meta and best_meta.get("features_csv")
-            else None,
-        ),
-        (
-            "run_config.features_csv",
-            _resolve_local_path(str(run_cfg.get("features_csv")))
-            if run_cfg and run_cfg.get("features_csv")
-            else None,
-        ),
-    ]
-
-    seen: set[Path] = set()
-    for source_name, maybe_path in candidates:
-        if maybe_path is None:
-            continue
-        path = maybe_path.resolve()
-        if path in seen:
-            continue
-        seen.add(path)
-        if path.exists():
-            return path, source_name
-
-    return None, "unresolved"
-
-
-def _effective_cfg_from_sidecar_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(payload, dict):
-        return None
-    eff = payload.get("effective_extraction_config")
-    return eff if isinstance(eff, dict) else None
-
-
-def _load_effective_cfg_from_sidecar_path(path: Path | None) -> dict[str, Any] | None:
-    if path is None:
-        return None
-    payload = _safe_read_json(path)
-    return _effective_cfg_from_sidecar_payload(payload)
-
-
-def _infer_structure_extractor_from_feature_cols(feature_cols: list[str]) -> tuple[str | None, str]:
-    if not feature_cols:
-        return None, "no feature columns available"
-
-    v1_score = 0
-    v2_score = 0
-    for col in feature_cols:
-        c = str(col).strip().lower()
-        if c.startswith(("wpd_", "mfcc_", "dmfcc_", "ddmfcc_", "td_", "ss_", "br_", "tf_", "cx_")):
-            v2_score += 3
-        if re.match(r"^cwt_s\d+", c):
-            v2_score += 2
-
-        if c.startswith(
-            ("dwt_", "spectral_", "st_", "peak_freq_", "peak_mag_", "band_power_", "ratio_")
-        ):
-            v1_score += 2
-        if c in {"crest_factor", "waveform_length", "percentile_95"}:
-            v1_score += 1
-
-    if v2_score > v1_score:
-        return "v2", f"feature_cols heuristic (v2_score={v2_score}, v1_score={v1_score})"
-    if v1_score > v2_score:
-        return "v1", f"feature_cols heuristic (v1_score={v1_score}, v2_score={v2_score})"
-    return None, f"feature_cols heuristic inconclusive (v1_score={v1_score}, v2_score={v2_score})"
-
-
-def _resolve_structure_runtime_extraction_cfg(
-    *,
-    bundle_path: Path,
-    bundle_obj: dict[str, Any],
-    base_cfg: dict[str, Any],
-    feature_cols: list[str],
-) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    cfg = dict(base_cfg)
-    warnings: list[str] = []
-    info: dict[str, Any] = {
-        "training_extraction_config_source": None,
-        "training_sr_hz": None,
-        "training_sr_source": None,
-        "extractor_source": None,
-    }
-
-    model_root = _classical_model_root_from_bundle_path(bundle_path)
-    run_cfg = _safe_read_json(model_root / "run_config.json")
-    best_meta = _safe_read_json(model_root / "final_model" / "best_model_metadata.json")
-    training_features_csv, training_features_source = _resolve_classical_training_features_csv_path(
-        bundle_path
-    )
-
-    extraction_candidates: list[tuple[str, dict[str, Any] | None]] = [
-        (
-            "bundle.feature_extraction_config",
-            bundle_obj.get("feature_extraction_config")
-            if isinstance(bundle_obj.get("feature_extraction_config"), dict)
-            else None,
-        ),
-        (
-            "bundle.feature_extraction_sidecar.effective_extraction_config",
-            _effective_cfg_from_sidecar_payload(
-                bundle_obj.get("feature_extraction_sidecar")
-                if isinstance(bundle_obj.get("feature_extraction_sidecar"), dict)
-                else None
-            ),
-        ),
-        (
-            "best_model_metadata.feature_extraction_config",
-            best_meta.get("feature_extraction_config")
-            if isinstance(best_meta, dict)
-            and isinstance(best_meta.get("feature_extraction_config"), dict)
-            else None,
-        ),
-        (
-            "run_config.feature_extraction_config",
-            run_cfg.get("feature_extraction_config")
-            if isinstance(run_cfg, dict)
-            and isinstance(run_cfg.get("feature_extraction_config"), dict)
-            else None,
-        ),
-    ]
-
-    sidecar_paths: list[tuple[str, Path | None]] = [
-        (
-            "best_model_metadata.feature_extraction_sidecar_path",
-            _resolve_local_path(str(best_meta.get("feature_extraction_sidecar_path")))
-            if isinstance(best_meta, dict) and best_meta.get("feature_extraction_sidecar_path")
-            else None,
-        ),
-        (
-            "run_config.feature_extraction_sidecar_path",
-            _resolve_local_path(str(run_cfg.get("feature_extraction_sidecar_path")))
-            if isinstance(run_cfg, dict) and run_cfg.get("feature_extraction_sidecar_path")
-            else None,
-        ),
-        (
-            f"{training_features_source}.extractor_config_sidecar",
-            Path(str(training_features_csv) + ".extractor_config.json")
-            if training_features_csv is not None
-            else None,
-        ),
-    ]
-
-    seen_sidecar_paths: set[Path] = set()
-    for source_name, maybe_path in sidecar_paths:
-        if maybe_path is None:
-            continue
-        sidecar_path = maybe_path.resolve()
-        if sidecar_path in seen_sidecar_paths:
-            continue
-        seen_sidecar_paths.add(sidecar_path)
-        extraction_candidates.append(
-            (
-                f"{source_name}::{sidecar_path}",
-                _load_effective_cfg_from_sidecar_path(sidecar_path),
-            )
-        )
-
-    for source_name, cfg_candidate in extraction_candidates:
-        if isinstance(cfg_candidate, dict) and cfg_candidate:
-            cfg.update(cfg_candidate)
-            info["training_extraction_config_source"] = source_name
+        cand = pd.to_numeric(df[col], errors="coerce")
+        if np.isfinite(cand.to_numpy(dtype=np.float64)).any():
+            y_true_series = cand
             break
 
-    if info["training_extraction_config_source"] is None:
-        warnings.append(
-            "No structure extraction config sidecar found in training artifacts; "
-            "falling back to current configs/structure.yaml plus feature-signature inference."
+    if y_true_series is not None and "y_pred" in df.columns:
+        y_pred = pd.to_numeric(df["y_pred"], errors="coerce")
+        residual = y_pred - y_true_series
+        base = df.drop(
+            columns=["y_true", "residual_mm", "abs_residual_mm", "y_true_depth"],
+            errors="ignore",
         )
-
-    if info["training_extraction_config_source"] is None:
-        inferred_extractor, infer_source = _infer_structure_extractor_from_feature_cols(
-            feature_cols
-        )
-        if inferred_extractor is not None:
-            cfg["extractor"] = inferred_extractor
-            info["extractor_source"] = infer_source
-        else:
-            cfg["extractor"] = _normalise_structure_extractor(cfg.get("extractor", "v1"))
-            warnings.append(
-                "Could not infer structure extractor version from model features; "
-                "falling back to configs/structure.yaml default."
-            )
-            info["extractor_source"] = infer_source
+        base["y_true"] = y_true_series.to_numpy(dtype=np.float64)
+        base["residual_mm"] = residual.to_numpy(dtype=np.float64)
+        base["abs_residual_mm"] = np.abs(residual.to_numpy(dtype=np.float64))
+        df = base
     else:
-        cfg["extractor"] = _normalise_structure_extractor(cfg.get("extractor", "v1"))
-        info["extractor_source"] = (
-            f"training config ({info['training_extraction_config_source']})"
-            if info["training_extraction_config_source"] is not None
-            else "configs/structure.yaml"
+        df = df.drop(
+            columns=[
+                c
+                for c in ("y_true", "y_true_depth", "residual_mm", "abs_residual_mm")
+                if c in df.columns
+            ],
         )
 
-    training_sr_hz, training_sr_source = _resolve_classical_training_sr_hz(bundle_path)
-    if training_sr_hz is not None:
-        cfg["target_sr_hz"] = int(training_sr_hz)
-        info["training_sr_hz"] = int(training_sr_hz)
-        info["training_sr_source"] = training_sr_source
-    else:
-        warnings.append(
-            "Could not resolve structure training sr_hz_used from training features; "
-            "runtime extraction will use config ds_rate settings."
+    df = df.drop(
+        columns=[
+            c
+            for c in ("z_abs", "within_1sigma", "within_2sigma", "confidence_label", "residual")
+            if c in df.columns
+        ],
+    )
+    df.to_csv(predictions_csv, index=False)
+
+
+def _attach_actual_depth_mm_to_predictions_csv(
+    predictions_csv: Path,
+    actual_depth_mm: float | None,
+) -> None:
+    if actual_depth_mm is None or not predictions_csv.exists():
+        return
+    df = pd.read_csv(predictions_csv)
+    if df.empty:
+        return
+    df = df.copy()
+    depth = float(actual_depth_mm)
+    df["depth_mm"] = depth
+    if "residual" in df.columns and "y_pred" in df.columns:
+        df["residual"] = depth - pd.to_numeric(df["y_pred"], errors="coerce")
+    df.to_csv(predictions_csv, index=False)
+
+
+def _strip_ground_truth(predictions_csv: Path) -> None:
+    if not predictions_csv.exists():
+        return
+    df = pd.read_csv(predictions_csv)
+    cols = [
+        c
+        for c in (
+            "depth_mm",
+            "y_true_depth",
+            "y_true",
+            "residual",
+            "residual_mm",
+            "abs_residual_mm",
+            "z_abs",
+            "within_1sigma",
+            "within_2sigma",
         )
-        info["training_sr_source"] = "unresolved"
+        if c in df.columns
+    ]
+    if cols:
+        df.drop(columns=cols).to_csv(predictions_csv, index=False)
 
-    return cfg, info, warnings
+
+# ---------------------------------------------------------------------------
+# MAE resolution
+# ---------------------------------------------------------------------------
 
 
-def _resolve_airborne_runtime_extraction_cfg(
-    *,
-    bundle_path: Path,
-    bundle_obj: dict[str, Any],
-    base_cfg: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    cfg = dict(base_cfg)
-    warnings: list[str] = []
-    info: dict[str, Any] = {
-        "training_extraction_config_source": None,
-        "training_sr_hz": None,
-        "training_sr_source": None,
-    }
-
-    model_root = _classical_model_root_from_bundle_path(bundle_path)
-    run_cfg = _safe_read_json(model_root / "run_config.json")
-    best_meta = _safe_read_json(model_root / "final_model" / "best_model_metadata.json")
-    training_features_csv, training_features_source = _resolve_classical_training_features_csv_path(
-        bundle_path
+def _classical_model_root(bundle_path: Path) -> Path:
+    return (
+        bundle_path.parent.parent
+        if bundle_path.parent.name == "final_model"
+        else bundle_path.parent
     )
 
-    extraction_candidates: list[tuple[str, dict[str, Any] | None]] = [
-        (
-            "bundle.feature_extraction_config",
-            bundle_obj.get("feature_extraction_config")
-            if isinstance(bundle_obj.get("feature_extraction_config"), dict)
-            else None,
-        ),
-        (
-            "bundle.feature_extraction_sidecar.effective_extraction_config",
-            _effective_cfg_from_sidecar_payload(
-                bundle_obj.get("feature_extraction_sidecar")
-                if isinstance(bundle_obj.get("feature_extraction_sidecar"), dict)
-                else None
-            ),
-        ),
-        (
-            "best_model_metadata.feature_extraction_config",
-            best_meta.get("feature_extraction_config")
-            if isinstance(best_meta, dict)
-            and isinstance(best_meta.get("feature_extraction_config"), dict)
-            else None,
-        ),
-        (
-            "run_config.feature_extraction_config",
-            run_cfg.get("feature_extraction_config")
-            if isinstance(run_cfg, dict)
-            and isinstance(run_cfg.get("feature_extraction_config"), dict)
-            else None,
-        ),
-    ]
 
-    sidecar_paths: list[tuple[str, Path | None]] = [
-        (
-            "best_model_metadata.feature_extraction_sidecar_path",
-            _resolve_local_path(str(best_meta.get("feature_extraction_sidecar_path")))
-            if isinstance(best_meta, dict) and best_meta.get("feature_extraction_sidecar_path")
-            else None,
-        ),
-        (
-            "run_config.feature_extraction_sidecar_path",
-            _resolve_local_path(str(run_cfg.get("feature_extraction_sidecar_path")))
-            if isinstance(run_cfg, dict) and run_cfg.get("feature_extraction_sidecar_path")
-            else None,
-        ),
-        (
-            f"{training_features_source}.extractor_config_sidecar",
-            Path(str(training_features_csv) + ".extractor_config.json")
-            if training_features_csv is not None
-            else None,
-        ),
-    ]
-
-    seen_sidecar_paths: set[Path] = set()
-    for source_name, maybe_path in sidecar_paths:
-        if maybe_path is None:
-            continue
-        sidecar_path = maybe_path.resolve()
-        if sidecar_path in seen_sidecar_paths:
-            continue
-        seen_sidecar_paths.add(sidecar_path)
-        extraction_candidates.append(
-            (
-                f"{source_name}::{sidecar_path}",
-                _load_effective_cfg_from_sidecar_path(sidecar_path),
-            )
-        )
-
-    for source_name, cfg_candidate in extraction_candidates:
-        if isinstance(cfg_candidate, dict) and cfg_candidate:
-            cfg.update(cfg_candidate)
-            info["training_extraction_config_source"] = source_name
-            break
-
-    if info["training_extraction_config_source"] is None:
-        warnings.append(
-            "No airborne extraction config sidecar found in training artifacts; "
-            "falling back to current configs/airborne.yaml for non-SR extractor settings."
-        )
-
-    training_sr_hz, training_sr_source = _resolve_classical_training_sr_hz(bundle_path)
-    if training_sr_hz is not None:
-        cfg["target_sr"] = int(training_sr_hz)
-        info["training_sr_hz"] = int(training_sr_hz)
-        info["training_sr_source"] = training_sr_source
-    else:
-        warnings.append(
-            "Could not resolve airborne training sr_hz from training features; "
-            "runtime extraction will use configs/airborne.yaml target_sr."
-        )
-        info["training_sr_source"] = "unresolved"
-
-    return cfg, info, warnings
+def _dl_model_root(model_dir: Path) -> Path:
+    return model_dir.parent if model_dir.name == "final_model" else model_dir
 
 
-def _read_training_sr_mode_hz(features_csv: Path) -> int | None:
-    if not features_csv.exists():
-        return None
-    for col in ("sr_hz_used", "sr_hz"):
-        try:
-            series = pd.read_csv(features_csv, usecols=[col])[col]
-        except ValueError:
-            continue
-        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            continue
-        rounded = np.rint(vals).astype(np.int64)
-        mode = pd.Series(rounded).mode()
-        if not mode.empty and int(mode.iloc[0]) > 0:
-            return int(mode.iloc[0])
-    return None
+def _config_mae_fallback(cfg_node: dict[str, Any]) -> float | None:
+    raw = cfg_node.get("fusion_mae_fallback", cfg_node.get("validation_mae"))
+    return float(raw) if raw is not None else None
 
 
-def _resolve_classical_training_sr_hz(bundle_path: Path) -> tuple[int | None, str]:
-    path, source_name = _resolve_classical_training_features_csv_path(bundle_path)
-    if path is not None:
-        sr_hz = _read_training_sr_mode_hz(path)
-        if sr_hz is not None:
-            return sr_hz, f"{source_name}::{path}"
-    return None, "unresolved"
+def _read_classical_fusion_mae(bundle_path: Path, bundle: dict[str, Any]) -> float:
+    model_root = _classical_model_root(bundle_path)
+    if "model" in bundle:
+        metrics_path = model_root / "final_model" / "test_metrics.csv"
+        if not metrics_path.exists():
+            raise FileNotFoundError(f"Missing: {metrics_path}")
+        df = pd.read_csv(metrics_path)
+        if "holdout_mae_raw" not in df.columns:
+            raise KeyError(f"'holdout_mae_raw' missing in {metrics_path}")
+        maes = pd.to_numeric(df["holdout_mae_raw"], errors="coerce").to_numpy(dtype=np.float64)
+        maes = maes[np.isfinite(maes)]
+        if maes.size == 0:
+            raise ValueError(f"No finite holdout_mae_raw in {metrics_path}")
+        return float(maes[0])
+
+    if "members" in bundle:
+        pred_path = model_root / "ensemble_test_predictions.csv"
+        if not pred_path.exists():
+            raise FileNotFoundError(f"Missing: {pred_path}")
+        df = pd.read_csv(pred_path)
+        if "y_pred_raw" not in df.columns:
+            raise KeyError(f"'y_pred_raw' missing in {pred_path}")
+        target_col = "y_true" if "y_true" in df.columns else "depth_mm"
+        if target_col not in df.columns:
+            raise KeyError(f"No target column in {pred_path}")
+        yt = pd.to_numeric(df[target_col], errors="coerce").to_numpy(dtype=np.float64)
+        yp = pd.to_numeric(df["y_pred_raw"], errors="coerce").to_numpy(dtype=np.float64)
+        mask = np.isfinite(yt) & np.isfinite(yp)
+        if not np.any(mask):
+            raise ValueError(f"No finite pairs in {pred_path}")
+        return float(np.mean(np.abs(yt[mask] - yp[mask])))
+
+    raise KeyError(f"Unsupported bundle format: {list(bundle.keys())}")
 
 
-def _sha256_file(path: Path | None) -> str | None:
-    if path is None or not path.exists() or not path.is_file():
-        return None
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _resolve_classical_mae(
+    *,
+    bundle_path: Path,
+    bundle: dict[str, Any],
+    cfg_fallback: float | None,
+) -> tuple[float, str]:
+    try:
+        return _read_classical_fusion_mae(bundle_path, bundle), "holdout_artifacts"
+    except Exception as exc:
+        if cfg_fallback is not None:
+            logger.warning("Classical MAE fallback=%s: %s", cfg_fallback, exc)
+            return float(cfg_fallback), "config.fusion_mae_fallback"
+        raise
+
+
+def _resolve_dl_mae(
+    *,
+    model_dir: Path,
+    cfg_fallback: float | None,
+) -> tuple[float, str]:
+    try:
+        root = _dl_model_root(model_dir)
+        summary_path = root / "repeat_metrics_summary.json"
+        if not summary_path.exists():
+            raise FileNotFoundError(f"Missing: {summary_path}")
+        with open(summary_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        key = "mean_test_mae" if payload.get("mean_test_mae") is not None else "mean_val_mae"
+        mae = payload.get(key)
+        if mae is None:
+            raise KeyError(f"No MAE key in {summary_path}")
+        mae = float(mae)
+        if not np.isfinite(mae):
+            raise ValueError(f"Non-finite {key} in {summary_path}")
+        return mae, f"repeat_metrics_summary.json.{key}"
+    except Exception as exc:
+        if cfg_fallback is not None:
+            logger.warning("DL MAE fallback=%s: %s", cfg_fallback, exc)
+            return float(cfg_fallback), "config.fusion_mae_fallback"
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Extraction config resolution
+# ---------------------------------------------------------------------------
 
 
 def _safe_read_json(path: Path) -> dict[str, Any] | None:
@@ -1076,126 +815,221 @@ def _safe_read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _numeric_col_stats(df: pd.DataFrame, col: str) -> dict[str, float] | None:
-    if col not in df.columns:
+def _normalise_structure_extractor(raw: Any) -> str:
+    key = str(raw if raw is not None else "v1").strip().lower()
+    return "v2" if key == "extensive" else (key if key in {"v1", "v2"} else "v1")
+
+
+def _infer_structure_extractor(feature_cols: list[str]) -> str | None:
+    if not feature_cols:
         return None
-    s = pd.to_numeric(df[col], errors="coerce")
-    s = s[np.isfinite(s)]
-    if s.empty:
+    v1 = v2 = 0
+    for col in feature_cols:
+        c = str(col).strip().lower()
+        if c.startswith(("wpd_", "mfcc_", "dmfcc_", "ddmfcc_", "td_", "ss_", "br_", "tf_", "cx_")):
+            v2 += 3
+        if re.match(r"^cwt_s\d+", c):
+            v2 += 2
+        if c.startswith(
+            ("dwt_", "spectral_", "st_", "peak_freq_", "peak_mag_", "band_power_", "ratio_")
+        ):
+            v1 += 2
+        if c in {"crest_factor", "waveform_length", "percentile_95"}:
+            v1 += 1
+    if v2 > v1:
+        return "v2"
+    if v1 > v2:
+        return "v1"
+    return None
+
+
+def _resolve_training_features_csv(bundle_path: Path) -> Path | None:
+    model_root = _classical_model_root(bundle_path)
+    for cfg_path in (
+        model_root / "final_model" / "best_model_metadata.json",
+        model_root / "run_config.json",
+    ):
+        payload = _safe_read_json(cfg_path)
+        if payload and payload.get("features_csv"):
+            p_str = str(payload["features_csv"])
+            p = Path(p_str) if Path(p_str).is_absolute() else Path.cwd() / p_str
+            if p.exists():
+                return p
+    return None
+
+
+def _read_training_sr_hz(features_csv: Path) -> int | None:
+    if not features_csv.exists():
         return None
-    return {
-        "min": float(s.min()),
-        "max": float(s.max()),
-        "mean": float(s.mean()),
-    }
+    for col in ("sr_hz_used", "sr_hz"):
+        try:
+            series = pd.read_csv(features_csv, usecols=[col])[col]
+        except ValueError:
+            continue
+        vals = pd.to_numeric(series, errors="coerce").to_numpy(dtype=np.float64)
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        mode = pd.Series(np.rint(vals).astype(np.int64)).mode()
+        if not mode.empty and int(mode.iloc[0]) > 0:
+            return int(mode.iloc[0])
+    return None
 
 
-def _sampling_stats(df: pd.DataFrame) -> dict[str, dict[str, float]]:
-    stats: dict[str, dict[str, float]] = {}
-    for c in ("sr_hz", "sr_hz_native", "sr_hz_used", "ds_rate", "duration_s"):
-        st = _numeric_col_stats(df, c)
-        if st is not None:
-            stats[c] = st
-    return stats
-
-
-def _bundle_pred_diagnostics(bundle: PredictionBundle) -> dict[str, Any]:
-    if bundle.y_true is None:
-        return {
-            "bias_mm": None,
-            "corr_true_pred": None,
-            "slope_pred_vs_true": None,
-            "intercept_pred_vs_true": None,
-            "mean_pred_mm": float(np.mean(bundle.y_pred)) if len(bundle.y_pred) else None,
-            "mean_true_mm": None,
-        }
-
-    y_true = np.asarray(bundle.y_true, dtype=np.float64)
-    y_pred = np.asarray(bundle.y_pred, dtype=np.float64)
-    mask = np.isfinite(y_true) & np.isfinite(y_pred)
-    if not np.any(mask):
-        return {
-            "bias_mm": None,
-            "corr_true_pred": None,
-            "slope_pred_vs_true": None,
-            "intercept_pred_vs_true": None,
-            "mean_pred_mm": None,
-            "mean_true_mm": None,
-        }
-
-    yt = y_true[mask]
-    yp = y_pred[mask]
-    bias = float(np.mean(yp - yt))
-    mean_pred = float(np.mean(yp))
-    mean_true = float(np.mean(yt))
-    if len(yt) < 2:
-        return {
-            "bias_mm": bias,
-            "corr_true_pred": None,
-            "slope_pred_vs_true": None,
-            "intercept_pred_vs_true": None,
-            "mean_pred_mm": mean_pred,
-            "mean_true_mm": mean_true,
-        }
-    corr = float(np.corrcoef(yt, yp)[0, 1])
-    slope, intercept = np.polyfit(yt, yp, 1)
-    return {
-        "bias_mm": bias,
-        "corr_true_pred": corr,
-        "slope_pred_vs_true": float(slope),
-        "intercept_pred_vs_true": float(intercept),
-        "mean_pred_mm": mean_pred,
-        "mean_true_mm": mean_true,
-    }
-
-
-def _snapped_mae_mm(bundle: PredictionBundle, step_mm: float | None) -> float | None:
-    if bundle.y_true is None or step_mm is None or step_mm <= 0:
-        return None
-    y_true = np.asarray(bundle.y_true, dtype=np.float64)
-    y_pred = np.asarray(bundle.y_pred, dtype=np.float64)
-    mask = np.isfinite(y_true) & np.isfinite(y_pred)
-    if not np.any(mask):
-        return None
-    yp = y_pred[mask]
-    yt = y_true[mask]
-    yp_snap = np.round(yp / step_mm) * step_mm
-    return float(np.mean(np.abs(yp_snap - yt)))
-
-
-def _apples_to_apples_entry(
+def _resolve_extraction_cfg(
     *,
-    reference_mae_raw_mm: float | None,
-    new_batch_mae_raw_mm: float | None,
-    diagnostics: dict[str, Any],
-    reference_mae_snapped_mm: float | None = None,
-    new_batch_mae_snapped_mm: float | None = None,
-) -> dict[str, Any]:
-    raw_mae_delta_mm = None
-    raw_mae_ratio = None
-    if reference_mae_raw_mm is not None and new_batch_mae_raw_mm is not None:
-        ref = float(reference_mae_raw_mm)
-        new = float(new_batch_mae_raw_mm)
-        raw_mae_delta_mm = new - ref
-        if ref > 0:
-            raw_mae_ratio = new / ref
+    bundle_path: Path,
+    bundle_obj: dict[str, Any],
+    base_cfg: dict[str, Any],
+    modality: str,
+    feature_cols: list[str],
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Resolve runtime extraction config from training artifacts."""
+    cfg = dict(base_cfg)
+    warnings: list[str] = []
+    info: dict[str, Any] = {"training_extraction_config_source": None}
 
+    model_root = _classical_model_root(bundle_path)
+    for source, candidate in [
+        (
+            "bundle",
+            bundle_obj.get("feature_extraction_config")
+            if isinstance(bundle_obj.get("feature_extraction_config"), dict)
+            else None,
+        ),
+        (
+            "best_model_metadata",
+            (_safe_read_json(model_root / "final_model" / "best_model_metadata.json") or {}).get(
+                "feature_extraction_config"
+            ),
+        ),
+        (
+            "run_config",
+            (_safe_read_json(model_root / "run_config.json") or {}).get(
+                "feature_extraction_config"
+            ),
+        ),
+    ]:
+        if isinstance(candidate, dict) and candidate:
+            cfg.update(candidate)
+            info["training_extraction_config_source"] = source
+            break
+
+    if info["training_extraction_config_source"] is None:
+        warnings.append(f"No extraction config sidecar for {modality}; using current YAML config.")
+
+    if modality == "structure":
+        if info["training_extraction_config_source"] is None:
+            inferred = _infer_structure_extractor(feature_cols)
+            cfg["extractor"] = inferred or _normalise_structure_extractor(cfg.get("extractor"))
+        else:
+            cfg["extractor"] = _normalise_structure_extractor(cfg.get("extractor"))
+
+    training_csv = _resolve_training_features_csv(bundle_path)
+    if training_csv:
+        sr_hz = _read_training_sr_hz(training_csv)
+        if sr_hz is not None:
+            sr_key = "target_sr_hz" if modality == "structure" else "target_sr"
+            cfg[sr_key] = int(sr_hz)
+            info["training_sr_hz"] = int(sr_hz)
+
+    return cfg, info, warnings
+
+
+# ---------------------------------------------------------------------------
+# Quality / metrics helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_rel(path: Path, base: Path) -> str:
+    try:
+        return str(path.relative_to(base))
+    except Exception:
+        return str(path)
+
+
+def _quality_entry(
+    bundle: PredictionBundle,
+    *,
+    predictions_csv: Path,
+    run_dir: Path,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "predictions_csv": _safe_rel(predictions_csv, run_dir),
+        **bundle_batch_metrics(bundle),
+    }
+    has_real_sigma = bool(bundle.metadata.get("has_real_sigma", False))
+    if not has_real_sigma:
+        return out
+
+    sigma_vals = np.asarray(bundle.sigma, dtype=np.float64)
+    sigma_valid = sigma_vals[np.isfinite(sigma_vals)]
+    if len(sigma_valid):
+        out["sigma_mean_mm"] = float(np.mean(sigma_valid))
+
+    if bundle.y_true is not None:
+        yp = np.asarray(bundle.y_pred, dtype=np.float64)
+        yt = np.asarray(bundle.y_true, dtype=np.float64)
+        sg = np.asarray(bundle.sigma, dtype=np.float64)
+        mask = np.isfinite(yp) & np.isfinite(yt) & np.isfinite(sg) & (sg > 0)
+        if np.any(mask):
+            abs_res = np.abs(yp[mask] - yt[mask])
+            out["coverage_1sigma"] = float(np.mean(abs_res <= sg[mask]))
+            out["coverage_2sigma"] = float(np.mean(abs_res <= (2.0 * sg[mask])))
+    return out
+
+
+def _bundle_diagnostics(bundle: PredictionBundle) -> dict[str, Any]:
+    yp = np.asarray(bundle.y_pred, dtype=np.float64)
+    if bundle.y_true is None:
+        return {"bias_mm": None, "mean_pred_mm": float(np.mean(yp)) if len(yp) else None}
+    yt = np.asarray(bundle.y_true, dtype=np.float64)
+    mask = np.isfinite(yt) & np.isfinite(yp)
+    if not np.any(mask):
+        return {"bias_mm": None, "mean_pred_mm": None}
+    out: dict[str, Any] = {"bias_mm": float(np.mean(yp[mask] - yt[mask]))}
+    if mask.sum() >= 2:
+        out["corr_true_pred"] = float(np.corrcoef(yt[mask], yp[mask])[0, 1])
+    return out
+
+
+def _apples_entry(
+    *,
+    ref_mae: float | None,
+    batch_mae: float | None,
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    delta = (batch_mae - ref_mae) if ref_mae is not None and batch_mae is not None else None
+    ratio = (batch_mae / ref_mae) if delta is not None and ref_mae and ref_mae > 0 else None
     return {
-        "reference_mae_raw_mm": reference_mae_raw_mm,
-        "reference_mae_snapped_mm": reference_mae_snapped_mm,
-        "new_batch_mae_raw_mm": new_batch_mae_raw_mm,
-        "new_batch_mae_snapped_mm": new_batch_mae_snapped_mm,
-        "raw_mae_delta_mm": raw_mae_delta_mm,
-        "raw_mae_ratio": raw_mae_ratio,
+        "reference_mae_raw_mm": ref_mae,
+        "new_batch_mae_raw_mm": batch_mae,
+        "raw_mae_delta_mm": delta,
+        "raw_mae_ratio": ratio,
         "diagnostics": diagnostics,
     }
+
+
+# ---------------------------------------------------------------------------
+# Setup audit / lock
+# ---------------------------------------------------------------------------
+
+
+def _sha256_file(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def _bundle_feature_cols(bundle_obj: dict[str, Any] | None) -> list[str]:
     if not bundle_obj:
         return []
     if "feature_cols" in bundle_obj:
-        cols = bundle_obj.get("feature_cols")
+        cols = bundle_obj["feature_cols"]
         return [str(c) for c in cols] if isinstance(cols, list) else []
     members = bundle_obj.get("members")
     if isinstance(members, list) and members and isinstance(members[0], dict):
@@ -1204,349 +1038,51 @@ def _bundle_feature_cols(bundle_obj: dict[str, Any] | None) -> list[str]:
     return []
 
 
-def _read_training_reference_snapped_mae_mm(classical_model_root: Path) -> float | None:
-    p = classical_model_root / "final_model" / "ensemble_test_metrics.csv"
-    if not p.exists():
-        return None
-    try:
-        df = pd.read_csv(p)
-        if df.empty:
-            return None
-        for col in ("ensemble_mae", "holdout_mae"):
-            if col in df.columns:
-                val = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=np.float64)
-                val = val[np.isfinite(val)]
-                if val.size:
-                    return float(val[0])
-    except Exception:
-        return None
-    return None
-
-
 def _classical_setup_snapshot(
     *,
     model_key: str,
-    bundle_path: Path | None,
-    bundle_obj: dict[str, Any] | None,
+    bundle_path: Path,
+    bundle_obj: dict[str, Any],
     reference_mae_source: str,
     reference_mae_mm: float | None,
-    runtime_pred_csv: Path,
-    runtime_features_csv: Path | None,
-    runtime_extraction_replay: dict[str, Any] | None,
     run_dir: Path,
-) -> tuple[dict[str, Any], list[str]]:
-    warnings: list[str] = []
+) -> dict[str, Any]:
     feature_cols = _bundle_feature_cols(bundle_obj)
-    model_root = _classical_model_root_from_bundle_path(bundle_path) if bundle_path else None
-    run_cfg_path = model_root / "run_config.json" if model_root else None
-    meta_path = model_root / "final_model" / "best_model_metadata.json" if model_root else None
-    run_cfg = _safe_read_json(run_cfg_path) if run_cfg_path else None
-    best_meta = _safe_read_json(meta_path) if meta_path else None
-
-    features_csv_train: Path | None = None
-    if best_meta and best_meta.get("features_csv"):
-        features_csv_train = _resolve_local_path(str(best_meta["features_csv"]))
-    elif run_cfg and run_cfg.get("features_csv"):
-        features_csv_train = _resolve_local_path(str(run_cfg["features_csv"]))
-
-    training_extraction_config: dict[str, Any] | None = None
-    training_extraction_config_source: str | None = None
-    if bundle_obj and isinstance(bundle_obj.get("feature_extraction_config"), dict):
-        training_extraction_config = dict(bundle_obj["feature_extraction_config"])
-        training_extraction_config_source = "bundle.feature_extraction_config"
-    elif best_meta and isinstance(best_meta.get("feature_extraction_config"), dict):
-        training_extraction_config = dict(best_meta["feature_extraction_config"])
-        training_extraction_config_source = "best_model_metadata.feature_extraction_config"
-    elif run_cfg and isinstance(run_cfg.get("feature_extraction_config"), dict):
-        training_extraction_config = dict(run_cfg["feature_extraction_config"])
-        training_extraction_config_source = "run_config.feature_extraction_config"
-    else:
-        sidecar_candidates: list[tuple[str, Path | None]] = [
-            (
-                "best_model_metadata.feature_extraction_sidecar_path",
-                _resolve_local_path(str(best_meta.get("feature_extraction_sidecar_path")))
-                if best_meta and best_meta.get("feature_extraction_sidecar_path")
-                else None,
-            ),
-            (
-                "run_config.feature_extraction_sidecar_path",
-                _resolve_local_path(str(run_cfg.get("feature_extraction_sidecar_path")))
-                if run_cfg and run_cfg.get("feature_extraction_sidecar_path")
-                else None,
-            ),
-            (
-                "features_csv.extractor_config_sidecar",
-                Path(str(features_csv_train) + ".extractor_config.json")
-                if features_csv_train is not None
-                else None,
-            ),
-        ]
-        seen_sidecars: set[Path] = set()
-        for source_name, maybe_path in sidecar_candidates:
-            if maybe_path is None:
-                continue
-            path = maybe_path.resolve()
-            if path in seen_sidecars:
-                continue
-            seen_sidecars.add(path)
-            payload = _safe_read_json(path)
-            effective_cfg = _effective_cfg_from_sidecar_payload(payload)
-            if effective_cfg:
-                training_extraction_config = dict(effective_cfg)
-                training_extraction_config_source = f"{source_name}::{path}"
-                break
-
-    train_sampling: dict[str, dict[str, float]] = {}
-    missing_in_training_source: list[str] = []
-    if features_csv_train and features_csv_train.exists():
-        try:
-            df_train = pd.read_csv(features_csv_train)
-            train_sampling = _sampling_stats(df_train)
-            train_cols = set(df_train.columns)
-            missing_in_training_source = [c for c in feature_cols if c not in train_cols]
-            if missing_in_training_source:
-                warnings.append(
-                    f"{model_key}: training feature source is missing {len(missing_in_training_source)} "
-                    f"required model feature(s)."
-                )
-        except Exception:
-            warnings.append(f"{model_key}: failed to read training feature source CSV.")
-
-    runtime_sampling: dict[str, dict[str, float]] = {}
-    try:
-        df_runtime = pd.read_csv(runtime_pred_csv)
-        runtime_sampling = _sampling_stats(df_runtime)
-    except Exception:
-        warnings.append(f"{model_key}: failed to read runtime predictions CSV for sampling stats.")
-
-    runtime_feature_missing_required: list[str] = []
-    runtime_feature_all_nan_required: list[str] = []
-    runtime_feature_cols_total: int | None = None
-    if runtime_features_csv is not None and Path(runtime_features_csv).exists():
-        try:
-            df_runtime_feat = pd.read_csv(runtime_features_csv)
-            runtime_feature_cols_total = int(len(df_runtime_feat.columns))
-            runtime_cols = set(df_runtime_feat.columns)
-            runtime_feature_missing_required = [c for c in feature_cols if c not in runtime_cols]
-            for c in feature_cols:
-                if c not in runtime_cols:
-                    continue
-                vals = pd.to_numeric(df_runtime_feat[c], errors="coerce").to_numpy(dtype=np.float64)
-                if not np.isfinite(vals).any():
-                    runtime_feature_all_nan_required.append(c)
-            if runtime_feature_missing_required:
-                warnings.append(
-                    f"{model_key}: runtime features are missing {len(runtime_feature_missing_required)} "
-                    f"required model feature(s)."
-                )
-            if runtime_feature_all_nan_required:
-                warnings.append(
-                    f"{model_key}: runtime features contain {len(runtime_feature_all_nan_required)} "
-                    f"required model feature(s) that are all-NaN."
-                )
-        except Exception:
-            warnings.append(
-                f"{model_key}: failed to read runtime features CSV for feature coverage."
-            )
-
-    # Sampling mismatch checks on common columns.
-    for c in sorted(set(train_sampling.keys()) & set(runtime_sampling.keys())):
-        tr_mean = train_sampling[c]["mean"]
-        rt_mean = runtime_sampling[c]["mean"]
-        if not np.isfinite(tr_mean) or not np.isfinite(rt_mean):
-            continue
-        if abs(tr_mean - rt_mean) > max(1e-6, 1e-3 * max(abs(tr_mean), abs(rt_mean), 1.0)):
-            warnings.append(
-                f"{model_key}: sampling column {c} mean mismatch (train={tr_mean}, runtime={rt_mean})."
-            )
-
-    snapshot = {
+    return {
         "model_kind": "classical",
-        "bundle_path": _safe_rel(bundle_path, run_dir) if bundle_path else None,
-        "bundle_path_sha256": _sha256_file(bundle_path) if bundle_path else None,
+        "bundle_path": _safe_rel(bundle_path, run_dir),
+        "bundle_path_sha256": _sha256_file(bundle_path),
         "reference_mae_raw_mm": reference_mae_mm,
         "reference_mae_source": reference_mae_source,
-        "bundle_defaults": {
-            "snap_predictions": bundle_obj.get("snap_predictions") if bundle_obj else None,
-            "doe_step_mm": bundle_obj.get("doe_step_mm") if bundle_obj else None,
-            "target_col": bundle_obj.get("target_col") if bundle_obj else None,
-            "group_col": bundle_obj.get("group_col") if bundle_obj else None,
-        },
         "model_feature_signature": {
-            "n_features": int(len(feature_cols)),
-            "sha256": hashlib.sha256("|".join(feature_cols).encode("utf-8")).hexdigest()
+            "n_features": len(feature_cols),
+            "sha256": hashlib.sha256("|".join(feature_cols).encode()).hexdigest()
             if feature_cols
             else None,
         },
-        "training_artifacts": {
-            "run_config_path": _safe_rel(run_cfg_path, run_dir) if run_cfg_path else None,
-            "best_model_metadata_path": _safe_rel(meta_path, run_dir) if meta_path else None,
-            "features_csv_path": _safe_rel(features_csv_train, run_dir)
-            if features_csv_train
-            else None,
-            "features_csv_sha256": _sha256_file(features_csv_train),
-            "features_sampling_stats": train_sampling,
-            "features_missing_required_model_cols": missing_in_training_source,
-            "feature_extraction_config_source": training_extraction_config_source,
-            "feature_extraction_config": training_extraction_config,
-            "best_model_metadata": best_meta,
-        },
-        "runtime_artifacts": {
-            "predictions_csv_path": _safe_rel(runtime_pred_csv, run_dir),
-            "predictions_csv_sampling_stats": runtime_sampling,
-            "features_csv_path": _safe_rel(runtime_features_csv, run_dir)
-            if runtime_features_csv is not None
-            else None,
-            "features_columns_total": runtime_feature_cols_total,
-            "features_required_missing_model_cols": runtime_feature_missing_required,
-            "features_required_all_nan_model_cols": runtime_feature_all_nan_required,
-            "extraction_replay": runtime_extraction_replay,
-        },
     }
-    return snapshot, warnings
 
 
 def _dl_setup_snapshot(
     *,
-    model_key: str,
     model_dir: Path | None,
     reference_mae_source: str,
     reference_mae_mm: float | None,
     run_dir: Path,
 ) -> dict[str, Any]:
     if model_dir is None:
-        return {
-            "model_kind": "dl",
-            "model_dir": None,
-            "reference_mae_raw_mm": reference_mae_mm,
-            "reference_mae_source": reference_mae_source,
-        }
-    model_root = _dl_model_root(model_dir)
-    cfg_path = (
-        model_root / "final_model" / "config.json"
-        if (model_root / "final_model" / "config.json").exists()
-        else model_root / "config.json"
-    )
-    cfg_payload = _safe_read_json(cfg_path)
-    file_table_path = (
-        model_root / "final_model" / "file_table.csv"
-        if (model_root / "final_model" / "file_table.csv").exists()
-        else model_root / "file_table.csv"
-    )
-    file_table_stats: dict[str, dict[str, float]] = {}
-    if file_table_path.exists():
-        try:
-            df = pd.read_csv(file_table_path)
-            file_table_stats = _sampling_stats(df)
-        except Exception:
-            file_table_stats = {}
+        return {"model_kind": "dl", "model_dir": None, "reference_mae_raw_mm": reference_mae_mm}
+    root = _dl_model_root(model_dir)
+    cfg_path = root / "final_model" / "config.json"
+    if not cfg_path.exists():
+        cfg_path = root / "config.json"
     return {
         "model_kind": "dl",
         "model_dir": _safe_rel(model_dir, run_dir),
-        "config_path": _safe_rel(cfg_path, run_dir),
         "config_sha256": _sha256_file(cfg_path),
         "reference_mae_raw_mm": reference_mae_mm,
         "reference_mae_source": reference_mae_source,
-        "training_file_table_path": _safe_rel(file_table_path, run_dir)
-        if file_table_path.exists()
-        else None,
-        "training_file_table_sampling_stats": file_table_stats,
-        "model_config": cfg_payload,
     }
-
-
-def _model_setup_lock_entry(snapshot: dict[str, Any]) -> dict[str, Any]:
-    kind = str(snapshot.get("model_kind", ""))
-    if kind == "classical":
-        sig = snapshot.get("model_feature_signature", {})
-        if not isinstance(sig, dict):
-            sig = {}
-        return {
-            "model_kind": "classical",
-            "bundle_path": snapshot.get("bundle_path"),
-            "bundle_path_sha256": snapshot.get("bundle_path_sha256"),
-            "model_feature_signature_n_features": sig.get("n_features"),
-            "model_feature_signature_sha256": sig.get("sha256"),
-            "reference_mae_raw_mm": snapshot.get("reference_mae_raw_mm"),
-            "reference_mae_source": snapshot.get("reference_mae_source"),
-        }
-    if kind == "dl":
-        return {
-            "model_kind": "dl",
-            "model_dir": snapshot.get("model_dir"),
-            "config_path": snapshot.get("config_path"),
-            "config_sha256": snapshot.get("config_sha256"),
-            "reference_mae_raw_mm": snapshot.get("reference_mae_raw_mm"),
-            "reference_mae_source": snapshot.get("reference_mae_source"),
-        }
-    return {"model_kind": kind}
-
-
-def _build_model_setup_lock_payload(setup_audit: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    models_obj = setup_audit.get("models", {})
-    models: dict[str, Any] = {}
-    if isinstance(models_obj, dict):
-        for model_key in sorted(models_obj.keys()):
-            model_snapshot = models_obj.get(model_key)
-            if isinstance(model_snapshot, dict):
-                models[model_key] = _model_setup_lock_entry(model_snapshot)
-
-    run_cfg = setup_audit.get("run_config_snapshot", {})
-    if not isinstance(run_cfg, dict):
-        run_cfg = {}
-
-    return {
-        "description": "Canonical lock snapshot of model artifacts used for fused prediction runs.",
-        "run_name": run_dir.name,
-        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "run_dir": str(run_dir),
-        "final_prediction_config": run_cfg.get("final_prediction_config"),
-        "models": models,
-    }
-
-
-def _compare_model_setup_locks(
-    previous_lock: dict[str, Any] | None,
-    current_lock: dict[str, Any],
-) -> list[str]:
-    if not isinstance(previous_lock, dict):
-        return []
-
-    warnings: list[str] = []
-    prev_models = previous_lock.get("models", {})
-    cur_models = current_lock.get("models", {})
-    if not isinstance(prev_models, dict):
-        prev_models = {}
-    if not isinstance(cur_models, dict):
-        cur_models = {}
-
-    for key in sorted(set(prev_models.keys()) | set(cur_models.keys())):
-        if key not in prev_models:
-            warnings.append(f"setup-lock drift: model '{key}' added vs previous latest lock.")
-            continue
-        if key not in cur_models:
-            warnings.append(f"setup-lock drift: model '{key}' missing vs previous latest lock.")
-            continue
-
-        prev_entry = prev_models[key]
-        cur_entry = cur_models[key]
-        if not isinstance(prev_entry, dict) or not isinstance(cur_entry, dict):
-            continue
-
-        for field in (
-            "bundle_path_sha256",
-            "config_sha256",
-            "model_feature_signature_sha256",
-            "model_feature_signature_n_features",
-        ):
-            prev_val = prev_entry.get(field)
-            cur_val = cur_entry.get(field)
-            if prev_val is not None and cur_val is not None and str(prev_val) != str(cur_val):
-                warnings.append(
-                    f"setup-lock drift: {key} field '{field}' changed "
-                    f"(prev={prev_val}, current={cur_val})."
-                )
-    return warnings
 
 
 def _persist_model_setup_lock(
@@ -1561,9 +1097,61 @@ def _persist_model_setup_lock(
     run_lock_path = lock_dir / f"{run_dir.name}_setup_lock.json"
     latest_lock_path = lock_dir / "LATEST_setup_lock.json"
 
-    lock_payload = _build_model_setup_lock_payload(setup_audit, run_dir)
+    # Build lock payload
+    models_obj = setup_audit.get("models", {})
+    lock_models: dict[str, Any] = {}
+    if isinstance(models_obj, dict):
+        for key in sorted(models_obj):
+            snap = models_obj[key]
+            if not isinstance(snap, dict):
+                continue
+            entry: dict[str, Any] = {
+                k: snap[k]
+                for k in (
+                    "model_kind",
+                    "bundle_path",
+                    "bundle_path_sha256",
+                    "config_sha256",
+                    "model_dir",
+                    "reference_mae_raw_mm",
+                    "reference_mae_source",
+                )
+                if k in snap and snap[k] is not None
+            }
+            sig = snap.get("model_feature_signature", {})
+            if isinstance(sig, dict):
+                entry["model_feature_signature_n_features"] = sig.get("n_features")
+                entry["model_feature_signature_sha256"] = sig.get("sha256")
+            lock_models[key] = entry
+
+    run_cfg = setup_audit.get("run_config_snapshot", {})
+    lock_payload = {
+        "description": "Model artifact lock for fused prediction runs.",
+        "run_name": run_dir.name,
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "run_dir": str(run_dir),
+        "final_prediction_config": (
+            run_cfg.get("final_prediction_config") if isinstance(run_cfg, dict) else None
+        ),
+        "models": lock_models,
+    }
+
+    # Drift check
     previous_lock = _safe_read_json(latest_lock_path)
-    drift_warnings = _compare_model_setup_locks(previous_lock, lock_payload)
+    drift_warnings: list[str] = []
+    if isinstance(previous_lock, dict):
+        prev_m = previous_lock.get("models", {})
+        cur_m = lock_payload["models"]
+        for k in sorted(set(prev_m) | set(cur_m)):
+            if k not in prev_m:
+                drift_warnings.append(f"setup-lock drift: model '{k}' added.")
+            elif k not in cur_m:
+                drift_warnings.append(f"setup-lock drift: model '{k}' missing.")
+            else:
+                for f in ("bundle_path_sha256", "config_sha256", "model_feature_signature_sha256"):
+                    pv, cv = prev_m[k].get(f), cur_m[k].get(f)
+                    if pv is not None and cv is not None and str(pv) != str(cv):
+                        drift_warnings.append(f"setup-lock drift: {k}.{f} changed.")
 
     with open(run_lock_path, "w", encoding="utf-8") as fh:
         json.dump(lock_payload, fh, indent=2)
@@ -1579,20 +1167,389 @@ def _persist_model_setup_lock(
     )
 
 
+# ---------------------------------------------------------------------------
+# Copy debug plots
+# ---------------------------------------------------------------------------
+
+
+def _copy_split_debug_plots_to_run_dir(
+    summary: dict[str, Any],
+    run_split_dir: Path,
+) -> dict[str, str]:
+    run_split_dir.mkdir(parents=True, exist_ok=True)
+    copied: dict[str, str] = {}
+    for key in ("debug_core", "debug_padded"):
+        raw_src = summary.get(key)
+        if not raw_src:
+            continue
+        src = Path(str(raw_src))
+        if not src.exists():
+            logger.warning("Missing split debug plot (%s): %s", key, src)
+            continue
+        dst = run_split_dir / src.name
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+        copied[key] = str(dst)
+    return copied
+
+
+# ---------------------------------------------------------------------------
+# Single-prediction report
+# ---------------------------------------------------------------------------
+
+
+def _single_prediction_report_payload(
+    *,
+    run_dir: Path,
+    final_predictions_csv: Path,
+    final_quality: dict[str, Any],
+    batch_quality: dict[str, Any],
+    actual_depth_mm: float | None,
+) -> dict[str, Any]:
+    final_df = pd.read_csv(final_predictions_csv)
+    pred_cols = [
+        c
+        for c in (
+            "record_name",
+            "y_pred",
+            "sigma",
+            "confidence_label",
+            "depth_mm",
+            "y_true",
+            "residual_mm",
+            "abs_residual_mm",
+            "z_abs",
+            "within_1sigma",
+            "within_2sigma",
+            "sigma_airborne_mm",
+            "sigma_structure_mm",
+            "sigma_between_modalities_mm",
+        )
+        if c in final_df
+    ]
+
+    y_pred = pd.to_numeric(
+        final_df.get("y_pred", pd.Series(dtype=float)),
+        errors="coerce",
+    ).to_numpy(dtype=np.float64)
+    y_pred = y_pred[np.isfinite(y_pred)]
+
+    return {
+        "description": "Single-mode prediction report.",
+        "mode": "single",
+        "actual_depth_mm": actual_depth_mm,
+        "models": batch_quality.get("models", {}),
+        "modality_fusions": batch_quality.get("modality_fusions", {}),
+        "final_prediction": {
+            **final_quality,
+            "prediction_summary": {
+                "n_predictions": len(final_df),
+                "y_pred_mean_mm": float(np.mean(y_pred)) if len(y_pred) else None,
+                "y_pred_min_mm": float(np.min(y_pred)) if len(y_pred) else None,
+                "y_pred_max_mm": float(np.max(y_pred)) if len(y_pred) else None,
+            },
+            "predictions": final_df[pred_cols].to_dict(orient="records"),
+            "predictions_csv": _safe_rel(final_predictions_csv, run_dir),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Modality defaults
+# ---------------------------------------------------------------------------
+
+_MODALITY_DEFAULTS = {
+    "airborne": {
+        "extractor": extract_airborne,
+        "default_file_glob": AIRBORNE_DEFAULT_FILE_GLOB,
+        "default_n_workers": AIRBORNE_DEFAULT_N_WORKERS,
+        "config_yaml": "configs/airborne.yaml",
+        "h5_data_key": "measurement/data",
+        "h5_time_key": "measurement/time_vector",
+        "default_enabled": True,
+    },
+    "structure": {
+        "extractor": extract_structure,
+        "default_file_glob": STRUCTURE_DEFAULT_FILE_GLOB,
+        "default_n_workers": STRUCTURE_DEFAULT_N_WORKERS,
+        "config_yaml": "configs/structure.yaml",
+        "h5_data_key": "measurement/data",
+        "h5_time_key": "measurement/time_vector",
+        "default_enabled": False,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Generic modality processing
+# ---------------------------------------------------------------------------
+
+
+def _process_modality(
+    *,
+    modality: str,
+    seg_dir: Path,
+    roots: set[str],
+    models_cfg: dict[str, Any],
+    split_cfg: dict[str, Any],
+    run_dir: Path,
+    mode: str,
+    actual_depth_mm: float | None,
+    fusion_min_weight: float,
+) -> ModalityResult:
+    """Process classical + DL inference and intra-fusion for one modality."""
+    result = ModalityResult()
+    defaults = _MODALITY_DEFAULTS[modality]
+    mod_dir = run_dir / modality
+    cls_cfg = models_cfg.get("classical", {})
+    dl_cfg = models_cfg.get("dl", {})
+    is_batch = mode == "batch"
+    default_enabled = defaults["default_enabled"]
+
+    h5_data_key = str(split_cfg.get("h5_data_key", defaults["h5_data_key"]))
+    h5_time_key = str(split_cfg.get("h5_time_key", defaults["h5_time_key"]))
+
+    classical_csv = mod_dir / "classical_predictions.csv"
+    dl_csv = mod_dir / "dl_predictions.csv"
+    features_csv = mod_dir / f"features_{modality}.csv"
+    cls_mae: float | None = None
+    cls_mae_source = ""
+    cls_bundle_path: Path | None = None
+    cls_bundle_obj: dict[str, Any] | None = None
+    dl_mae: float | None = None
+    dl_mae_source = ""
+    dl_model_dir: Path | None = None
+
+    # --- Classical inference ---
+    if cls_cfg.get("enabled", default_enabled) and cls_cfg.get("bundle_path"):
+        bundle_path = Path(cls_cfg["bundle_path"])
+        bundle = joblib.load(bundle_path)
+        cls_bundle_path = bundle_path
+        cls_bundle_obj = bundle
+        cls_mae, cls_mae_source = _resolve_classical_mae(
+            bundle_path=bundle_path,
+            bundle=bundle,
+            cfg_fallback=_config_mae_fallback(cls_cfg),
+        )
+        feat_cols = _bundle_feature_cols(bundle)
+        feat_cfg_raw = load_config(defaults["config_yaml"])
+        feat_cfg_base = feat_cfg_raw.get("classical", feat_cfg_raw)
+        feat_cfg, _info, cfg_warnings = _resolve_extraction_cfg(
+            bundle_path=bundle_path,
+            bundle_obj=bundle,
+            base_cfg=feat_cfg_base,
+            modality=modality,
+            feature_cols=feat_cols,
+        )
+        result.warnings.extend(cfg_warnings)
+
+        features_df = _extract_for_roots(
+            roots=roots,
+            segments_root=seg_dir,
+            extractor=defaults["extractor"],
+            cfg=feat_cfg,
+            file_glob=str(feat_cfg.get("file_glob", defaults["default_file_glob"])),
+            n_workers=int(feat_cfg.get("n_workers", defaults["default_n_workers"])),
+            grouped_by_root=is_batch,
+        )
+        if not is_batch and "depth_mm" in features_df.columns:
+            features_df = features_df.drop(columns=["depth_mm"], errors="ignore")
+        if feat_cols:
+            features_df = _ensure_feature_cols(features_df, feat_cols)
+        features_csv.parent.mkdir(parents=True, exist_ok=True)
+        features_df.to_csv(features_csv, index=False)
+
+        infer_classical(
+            bundle_path=bundle_path,
+            features_csv=features_csv,
+            out_csv=classical_csv,
+            snap_predictions=cls_cfg.get("snap_predictions"),
+            doe_step_mm=cls_cfg.get("snap_step_mm"),
+        )
+        if not is_batch and actual_depth_mm is None:
+            _strip_ground_truth(classical_csv)
+        else:
+            _attach_actual_depth_mm_to_predictions_csv(classical_csv, actual_depth_mm)
+        _cleanup_single_model_predictions_csv(classical_csv)
+
+    # --- DL inference ---
+    if dl_cfg.get("enabled", default_enabled) and dl_cfg.get("model_dir"):
+        dl_model_dir = Path(dl_cfg["model_dir"])
+        dl_mae, dl_mae_source = _resolve_dl_mae(
+            model_dir=dl_model_dir,
+            cfg_fallback=_config_mae_fallback(dl_cfg),
+        )
+        _infer_dl_on_segments(
+            model_dir=dl_model_dir,
+            segments_dir=seg_dir,
+            file_glob=None,
+            device=str(dl_cfg.get("device", "auto")),
+            batch_size=dl_cfg.get("batch_size"),
+            out_csv=dl_csv,
+            h5_data_key=h5_data_key,
+            h5_time_key=h5_time_key,
+            include_recording_roots=roots,
+            parse_depth_from_filename=is_batch,
+        )
+        if not is_batch and actual_depth_mm is None:
+            _strip_ground_truth(dl_csv)
+        else:
+            _attach_actual_depth_mm_to_predictions_csv(dl_csv, actual_depth_mm)
+        _cleanup_single_model_predictions_csv(dl_csv)
+
+    # --- Intra-modality fusion ---
+    has_cls = classical_csv.exists()
+    has_dl = dl_csv.exists()
+    if not has_cls and not has_dl:
+        return result
+
+    ensemble_name = f"{modality}_ensemble"
+
+    # Build bundles for available models
+    bundles_short: list[PredictionBundle] = []
+    bundles_long: list[PredictionBundle] = []
+
+    if has_cls:
+        if cls_mae is None:
+            raise RuntimeError(f"Missing MAE for {modality} classical.")
+        b = _bundle_from_pred_csv(
+            classical_csv,
+            f"{modality}_classical",
+            fusion_mae=cls_mae,
+            fusion_mae_source=cls_mae_source,
+        )
+        bundles_short.append(b)
+        bundles_long.append(
+            _bundle_from_pred_csv(
+                classical_csv,
+                f"{modality}_classical",
+                fusion_mae=cls_mae,
+                fusion_mae_source=cls_mae_source,
+                record_key_mode="record",
+            )
+        )
+        result.model_quality[f"{modality}_classical"] = _quality_entry(
+            b,
+            predictions_csv=classical_csv,
+            run_dir=run_dir,
+        )
+        result.model_apples[f"{modality}_classical"] = _apples_entry(
+            ref_mae=cls_mae,
+            batch_mae=result.model_quality[f"{modality}_classical"]["mae_mm"],
+            diagnostics=_bundle_diagnostics(b),
+        )
+        if cls_bundle_path:
+            result.model_setups[f"{modality}_classical"] = _classical_setup_snapshot(
+                model_key=f"{modality}_classical",
+                bundle_path=cls_bundle_path,
+                bundle_obj=cls_bundle_obj,
+                reference_mae_source=cls_mae_source,
+                reference_mae_mm=cls_mae,
+                run_dir=run_dir,
+            )
+
+    if has_dl:
+        if dl_mae is None:
+            raise RuntimeError(f"Missing MAE for {modality} DL.")
+        b = _bundle_from_pred_csv(
+            dl_csv,
+            f"{modality}_dl",
+            fusion_mae=dl_mae,
+            fusion_mae_source=dl_mae_source,
+        )
+        bundles_short.append(b)
+        bundles_long.append(
+            _bundle_from_pred_csv(
+                dl_csv,
+                f"{modality}_dl",
+                fusion_mae=dl_mae,
+                fusion_mae_source=dl_mae_source,
+                record_key_mode="record",
+            )
+        )
+        result.model_quality[f"{modality}_dl"] = _quality_entry(
+            b,
+            predictions_csv=dl_csv,
+            run_dir=run_dir,
+        )
+        result.model_apples[f"{modality}_dl"] = _apples_entry(
+            ref_mae=dl_mae,
+            batch_mae=result.model_quality[f"{modality}_dl"]["mae_mm"],
+            diagnostics=_bundle_diagnostics(b),
+        )
+        result.model_setups[f"{modality}_dl"] = _dl_setup_snapshot(
+            model_dir=dl_model_dir,
+            reference_mae_source=dl_mae_source,
+            reference_mae_mm=dl_mae,
+            run_dir=run_dir,
+        )
+
+    # Fuse or pass-through
+    if len(bundles_short) == 2:
+        fused_short = fuse_intra_modality(
+            bundles_short[0],
+            bundles_short[1],
+            ensemble_name,
+            min_weight=fusion_min_weight,
+        )
+        fused_long = fuse_intra_modality(
+            bundles_long[0],
+            bundles_long[1],
+            ensemble_name,
+            min_weight=fusion_min_weight,
+        )
+    else:
+        src = bundles_short[0]
+        fused_short = PredictionBundle(
+            modality=ensemble_name,
+            record_names=src.record_names.copy(),
+            y_pred=src.y_pred.copy(),
+            sigma=np.zeros_like(src.y_pred, dtype=np.float64),
+            validation_mae=src.validation_mae,
+            y_true=src.y_true.copy() if src.y_true is not None else None,
+            metadata={**src.metadata, "has_real_sigma": False},
+        )
+        src_l = bundles_long[0]
+        fused_long = PredictionBundle(
+            modality=ensemble_name,
+            record_names=src_l.record_names.copy(),
+            y_pred=src_l.y_pred.copy(),
+            sigma=np.zeros_like(src_l.y_pred, dtype=np.float64),
+            validation_mae=src_l.validation_mae,
+            y_true=src_l.y_true.copy() if src_l.y_true is not None else None,
+            metadata={**src_l.metadata, "has_real_sigma": False},
+        )
+
+    fusion_csv = _save_bundle_predictions_csv(
+        fused_short,
+        mod_dir / "fusion_predictions.csv",
+    )
+    _save_bundle_predictions_csv(fused_long, mod_dir / "fusion_predictions_long.csv")
+    result.fusion_quality[ensemble_name] = _quality_entry(
+        fused_short,
+        predictions_csv=fusion_csv,
+        run_dir=run_dir,
+    )
+    result.fused_bundle = fused_short
+    result.fused_long_bundle = fused_long
+    return result
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
-    # This project pins modern scientific stack (see pyproject.toml).
-    # Many stored Joblib bundles are not unpicklable on NumPy < 2.
     import numpy as _np
 
     if sys.version_info < (3, 13) or int(_np.__version__.split(".", 1)[0]) < 2:
         raise RuntimeError(
-            "Environment mismatch for vm-predict-fused.\n"
-            f"- Detected Python {sys.version_info.major}.{sys.version_info.minor}\n"
-            f"- Detected NumPy {_np.__version__}\n\n"
-            "This repo targets Python >= 3.13 and NumPy >= 2.0 (see pyproject.toml).\n"
-            "Re-run with the correct project environment/venv."
+            f"Environment mismatch: Python {sys.version_info.major}."
+            f"{sys.version_info.minor}, NumPy {_np.__version__}. "
+            "Requires Python >= 3.13 and NumPy >= 2.0."
         )
 
     cfg = load_config(args.config)
@@ -1603,7 +1560,10 @@ def main() -> None:
 
     run_out_root = Path(cfg.get("run", {}).get("out_dir", "data/fusion_results"))
     state_path = Path(
-        cfg.get("run", {}).get("state_json", "data/fusion_results/final_prediction_state.json")
+        cfg.get("run", {}).get(
+            "state_json",
+            "data/fusion_results/final_prediction_state.json",
+        )
     )
     run_tag = str(cfg.get("run", {}).get("tag", "manual"))
     run_dir = run_out_root / f"{_now_tag()}__{run_tag}"
@@ -1613,826 +1573,223 @@ def main() -> None:
     processed: dict[str, Any] = state.setdefault("processed", {})
     exp_map, doe_template = _expected_map(cfg)
 
-    only_air = args.only in {"both", "airborne"}
-    only_str = args.only in {"both", "structure"}
+    # Collect per-modality worklists
+    modality_work: dict[str, tuple[list[RawFile], Path]] = {}
+    for mod in ("airborne", "structure"):
+        if args.only not in {"both", mod}:
+            continue
+        inp = cfg.get("inputs", {}).get(mod, {})
+        if not inp.get("enabled", True):
+            continue
+        raw_dir = Path(inp["raw_dir"])
+        glob = str(inp.get("file_glob", "**/*.flac" if mod == "airborne" else "**/*.h5"))
+        work = [
+            rf
+            for rf in _scan_raw(raw_dir, glob)
+            if args.force
+            or str(rf.path.resolve()) not in processed
+            or processed[str(rf.path.resolve())].get("mtime_ns") != rf.mtime_ns
+        ]
+        if work:
+            modality_work[mod] = (work, raw_dir)
 
-    # Collect worklist
-    work_air: list[RawFile] = []
-    work_str: list[RawFile] = []
-
-    if only_air and bool(cfg.get("inputs", {}).get("airborne", {}).get("enabled", True)):
-        air_raw_dir = Path(cfg["inputs"]["airborne"]["raw_dir"])
-        air_glob = str(cfg["inputs"]["airborne"].get("file_glob", "**/*.flac"))
-        for rf in _scan_raw(air_raw_dir, air_glob):
-            key = str(rf.path.resolve())
-            if (
-                (not args.force)
-                and key in processed
-                and processed[key].get("mtime_ns") == rf.mtime_ns
-            ):
-                continue
-            work_air.append(rf)
-
-    if only_str and bool(cfg.get("inputs", {}).get("structure", {}).get("enabled", True)):
-        st_raw_dir = Path(cfg["inputs"]["structure"]["raw_dir"])
-        st_glob = str(cfg["inputs"]["structure"].get("file_glob", "**/*.h5"))
-        for rf in _scan_raw(st_raw_dir, st_glob):
-            key = str(rf.path.resolve())
-            if (
-                (not args.force)
-                and key in processed
-                and processed[key].get("mtime_ns") == rf.mtime_ns
-            ):
-                continue
-            work_str.append(rf)
-
-    if not work_air and not work_str:
+    if not modality_work:
         print("No new raw files detected (or all already processed).")
         return
 
-    # Restrict inference to segments generated from this run's raw-file stems.
-    air_roots = {rf.stem for rf in work_air}
-    str_roots = {rf.stem for rf in work_str}
-
     # Splitting
-    split_cfg = cfg.get("splitting", {})
-    common = split_cfg.get("common", {})
-    band_hz = (float(common.get("band_low_hz", 2000.0)), float(common.get("band_high_hz", 5000.0)))
-    common_band_fallbacks = common.get("band_fallbacks_hz", None)
+    seg_dirs: dict[str, Path] = {}
+    roots_map: dict[str, set[str]] = {}
 
-    seg_root_air = Path(
-        split_cfg.get("segments_root", {}).get(
-            "airborne", "data/raw_data_extracted_splits/air/live"
+    if args.mode == "batch":
+        split_cfg = cfg.get("splitting", {})
+        common = split_cfg.get("common", {})
+        band_hz = (
+            float(common.get("band_low_hz", 2000.0)),
+            float(common.get("band_high_hz", 5000.0)),
         )
-    )
-    seg_root_str = Path(
-        split_cfg.get("segments_root", {}).get(
-            "structure", "data/raw_data_extracted_splits/structure/live"
-        )
-    )
+        common_fallbacks = common.get("band_fallbacks_hz")
 
-    # Split airborne
-    seg_dir_air = None
-    if work_air:
-        air_split = split_cfg.get("airborne", {})
-        air_pre_pad_s = float(air_split.get("pre_pad_s", common.get("pre_pad_s", 0.20)))
-        air_post_pad_s = float(air_split.get("post_pad_s", common.get("post_pad_s", 0.25)))
-        air_band_fallbacks = air_split.get("band_fallbacks_hz", common_band_fallbacks)
-        logger.info(
-            "Airborne split padding resolved to pre_pad_s=%.3f, post_pad_s=%.3f",
-            air_pre_pad_s,
-            air_post_pad_s,
-        )
-        for rf in work_air:
-            target_seg_dir = seg_root_air / rf.stem
-            if target_seg_dir.exists():
-                shutil.rmtree(target_seg_dir)
-            expected = _resolve_expected(exp_map, rf.stem)
-            doe_df = _doe_for_file(doe_template, expected)
-            manifest_df, summary = process_one_file(
-                rf.path,
-                doe_df,
-                seg_root_air,
-                expected_segments=expected,
-                pre_pad_s=air_pre_pad_s,
-                post_pad_s=air_post_pad_s,
-                band_hz=band_hz,
-                band_hz_fallbacks=air_band_fallbacks,
-                export_format=str(air_split.get("export_format", "flac")),
-                target_sr=air_split.get("target_sr", None),
+        for mod, (work, _) in modality_work.items():
+            mod_split = split_cfg.get(mod, {})
+            seg_root = Path(
+                split_cfg.get("segments_root", {}).get(
+                    mod,
+                    f"data/raw_data_extracted_splits/{mod[:3]}/live",
+                )
             )
-            out_manifest = run_dir / "airborne" / rf.stem / "segments_manifest.csv"
-            out_manifest.parent.mkdir(parents=True, exist_ok=True)
-            copied_debug = _copy_split_debug_plots_to_run_dir(summary, out_manifest.parent)
-            manifest_df.to_csv(out_manifest, index=False)
-            processed[str(rf.path.resolve())] = {
-                "mtime_ns": rf.mtime_ns,
-                "modality": "airborne",
-                "stem": rf.stem,
-            }
-            logger.info(
-                "Split airborne %s -> %s (segments=%d, copied_debug=%d)",
-                rf.path.name,
-                summary["out_dir"],
-                summary["exported_segments_final"],
-                len(copied_debug),
-            )
-        seg_dir_air = seg_root_air
+            pre_pad = float(mod_split.get("pre_pad_s", common.get("pre_pad_s", 0.20)))
+            post_pad = float(mod_split.get("post_pad_s", common.get("post_pad_s", 0.25)))
+            fallbacks = mod_split.get("band_fallbacks_hz", common_fallbacks)
 
-    # Split structure
-    seg_dir_str = None
-    if work_str:
-        st_split = split_cfg.get("structure", {})
-        st_pre_pad_s = float(st_split.get("pre_pad_s", common.get("pre_pad_s", 0.20)))
-        st_post_pad_s = float(st_split.get("post_pad_s", common.get("post_pad_s", 0.25)))
-        st_band_fallbacks = st_split.get("band_fallbacks_hz", common_band_fallbacks)
-        logger.info(
-            "Structure split padding resolved to pre_pad_s=%.3f, post_pad_s=%.3f",
-            st_pre_pad_s,
-            st_post_pad_s,
-        )
-        for rf in work_str:
-            target_seg_dir = seg_root_str / rf.stem
-            if target_seg_dir.exists():
-                shutil.rmtree(target_seg_dir)
-            expected = _resolve_expected(exp_map, rf.stem)
-            doe_df = _doe_for_file(doe_template, expected)
-            manifest_df, summary = process_one_file(
-                rf.path,
-                doe_df,
-                seg_root_str,
-                expected_segments=expected,
-                pre_pad_s=st_pre_pad_s,
-                post_pad_s=st_post_pad_s,
-                band_hz=band_hz,
-                band_hz_fallbacks=st_band_fallbacks,
-                export_format=str(st_split.get("export_format", "h5")),
-                h5_data_key=str(st_split.get("h5_data_key", "measurement/data")),
-                h5_time_key=str(st_split.get("h5_time_key", "measurement/time_vector")),
-                target_sr=st_split.get("target_sr", None),
-            )
-            out_manifest = run_dir / "structure" / rf.stem / "segments_manifest.csv"
-            out_manifest.parent.mkdir(parents=True, exist_ok=True)
-            copied_debug = _copy_split_debug_plots_to_run_dir(summary, out_manifest.parent)
-            manifest_df.to_csv(out_manifest, index=False)
-            processed[str(rf.path.resolve())] = {
-                "mtime_ns": rf.mtime_ns,
-                "modality": "structure",
-                "stem": rf.stem,
-            }
-            logger.info(
-                "Split structure %s -> %s (segments=%d, copied_debug=%d)",
-                rf.path.name,
-                summary["out_dir"],
-                summary["exported_segments_final"],
-                len(copied_debug),
-            )
-        seg_dir_str = seg_root_str
+            for rf in work:
+                target = seg_root / rf.stem
+                if target.exists():
+                    shutil.rmtree(target)
+                expected = _resolve_expected(exp_map, rf.stem)
+                doe_df = _doe_for_file(doe_template, expected)
+                manifest_df, summary = process_one_file(
+                    rf.path,
+                    doe_df,
+                    seg_root,
+                    expected_segments=expected,
+                    pre_pad_s=pre_pad,
+                    post_pad_s=post_pad,
+                    band_hz=band_hz,
+                    band_hz_fallbacks=fallbacks,
+                    export_format=str(
+                        mod_split.get(
+                            "export_format",
+                            "flac" if mod == "airborne" else "h5",
+                        )
+                    ),
+                    h5_data_key=str(mod_split.get("h5_data_key", "measurement/data")),
+                    h5_time_key=str(mod_split.get("h5_time_key", "measurement/time_vector")),
+                    target_sr=mod_split.get("target_sr"),
+                )
+                manifest_out = run_dir / mod / rf.stem / "segments_manifest.csv"
+                manifest_out.parent.mkdir(parents=True, exist_ok=True)
+                _copy_split_debug_plots_to_run_dir(summary, manifest_out.parent)
+                manifest_df.to_csv(manifest_out, index=False)
+                processed[str(rf.path.resolve())] = {
+                    "mtime_ns": rf.mtime_ns,
+                    "modality": mod,
+                    "mode": "batch",
+                    "stem": rf.stem,
+                }
+                logger.info(
+                    "Split %s %s -> %d segments",
+                    mod,
+                    rf.path.name,
+                    summary["exported_segments_final"],
+                )
+            seg_dirs[mod] = seg_root
+            roots_map[mod] = {rf.stem for rf in work}
+    else:
+        for mod, (work, raw_dir) in modality_work.items():
+            seg_dirs[mod] = raw_dir
+            roots_map[mod] = {rf.stem for rf in work}
+            for rf in work:
+                processed[str(rf.path.resolve())] = {
+                    "mtime_ns": rf.mtime_ns,
+                    "modality": mod,
+                    "mode": "single",
+                    "stem": rf.stem,
+                }
 
     _save_state(state_path, state)
 
-    # Inference + fusion
-    fused_modality_bundles: list[PredictionBundle] = []
+    # Per-modality inference + fusion
+    fused_bundles: list[PredictionBundle] = []
+    fused_long_bundles: list[PredictionBundle] = []
     batch_quality: dict[str, Any] = {
-        "description": (
-            "Performance measured on this run's raw batch using labels available in the "
-            "prediction CSVs (depth_mm / y_true_depth / y_true)."
-        ),
-        "metrics_definition": {
-            "mae_mm": "Mean absolute error in mm on the current batch.",
-            "rmse_mm": "Root mean squared error in mm on the current batch.",
-        },
+        "description": "Performance on this run's batch.",
         "models": {},
         "modality_fusions": {},
         "final_fusion": None,
     }
     setup_audit: dict[str, Any] = {
-        "description": (
-            "Snapshot of model + data setup used by this run, plus compatibility checks "
-            "between training artifacts and current-batch inference setup."
-        ),
+        "description": "Model + data setup snapshot.",
         "models": {},
         "warnings": [],
     }
-    apples_to_apples: dict[str, Any] = {
-        "description": (
-            "Raw-mm apples-to-apples comparison between training reference metrics "
-            "(from each model's own artifacts) and current-batch metrics."
-        ),
+    apples: dict[str, Any] = {
+        "description": "Reference vs batch MAE comparison.",
         "models": {},
         "modality_fusions": {},
         "final_fusion": None,
     }
-    fusion_min_weight = float(cfg.get("models", {}).get("fusion", {}).get("min_weight", 0.05))
-
-    # Airborne
-    air_models_cfg = cfg.get("models", {}).get("airborne", {})
-    air_any_enabled = bool(air_models_cfg.get("classical", {}).get("enabled", True)) or bool(
-        air_models_cfg.get("dl", {}).get("enabled", True)
+    fusion_min_weight = float(
+        cfg.get("models", {}).get("fusion", {}).get("min_weight", 0.05),
     )
-    if seg_dir_air is not None and air_any_enabled:
-        air_cfg = cfg["models"]["airborne"]
 
-        # Classical (features)
-        cls_cfg = air_cfg.get("classical", {})
-        air_classical_csv = run_dir / "airborne" / "classical_predictions.csv"
-        air_features_csv = run_dir / "airborne" / "features_airborne.csv"
-        air_fusion_csv_path = run_dir / "airborne" / "fusion_predictions.csv"
-        air_runtime_extraction_replay: dict[str, Any] | None = None
-        air_classical_fusion_mae: float | None = None
-        air_classical_fusion_mae_source = ""
-        air_classical_bundle_path: Path | None = None
-        air_classical_bundle_obj: dict[str, Any] | None = None
-        if cls_cfg.get("enabled", True) and cls_cfg.get("bundle_path"):
-            bundle_path = Path(cls_cfg["bundle_path"])
-            bundle = joblib.load(bundle_path)
-            air_classical_bundle_path = bundle_path
-            air_classical_bundle_obj = bundle
-            air_classical_fusion_mae, air_classical_fusion_mae_source = (
-                _resolve_classical_fusion_mae(
-                    bundle_path=bundle_path,
-                    bundle=bundle,
-                    cfg_mae_fallback=_config_mae_fallback(cls_cfg),
-                )
-            )
-            feat_cols = None
-            if "feature_cols" in bundle:
-                feat_cols = list(bundle["feature_cols"])
-            elif "members" in bundle and bundle["members"]:
-                feat_cols = list(bundle["members"][0]["feature_cols"])
+    for mod in ("airborne", "structure"):
+        if mod not in seg_dirs:
+            continue
+        mod_cfg = cfg.get("models", {}).get(mod, {})
+        default_en = _MODALITY_DEFAULTS[mod]["default_enabled"]
+        if not (
+            mod_cfg.get("classical", {}).get("enabled", default_en)
+            or mod_cfg.get("dl", {}).get("enabled", default_en)
+        ):
+            continue
 
-            feat_cfg_raw = load_config("configs/airborne.yaml")
-            feat_cfg_base = feat_cfg_raw.get("classical", feat_cfg_raw)
-            feat_cfg, air_runtime_extraction_replay, air_cfg_replay_warnings = (
-                _resolve_airborne_runtime_extraction_cfg(
-                    bundle_path=bundle_path,
-                    bundle_obj=bundle,
-                    base_cfg=feat_cfg_base,
-                )
-            )
-            logger.info(
-                "Airborne classical runtime extraction config source=%s | target_sr=%s",
-                air_runtime_extraction_replay.get("training_extraction_config_source")
-                if air_runtime_extraction_replay
-                else None,
-                feat_cfg.get("target_sr"),
-            )
-            for warn_msg in air_cfg_replay_warnings:
-                logger.warning("%s", warn_msg)
-            setup_audit["warnings"].extend(air_cfg_replay_warnings)
-            features_df = _extract_for_roots(
-                roots=air_roots,
-                segments_root=seg_dir_air,
-                extractor=extract_airborne,
-                cfg=feat_cfg,
-                file_glob=str(feat_cfg.get("file_glob", AIRBORNE_DEFAULT_FILE_GLOB)),
-                n_workers=int(feat_cfg.get("n_workers", AIRBORNE_DEFAULT_N_WORKERS)),
-            )
-            if feat_cols is not None:
-                features_df = _ensure_feature_cols(features_df, feat_cols)
-            air_features_csv.parent.mkdir(parents=True, exist_ok=True)
-            features_df.to_csv(air_features_csv, index=False)
+        result = _process_modality(
+            modality=mod,
+            seg_dir=seg_dirs[mod],
+            roots=roots_map[mod],
+            models_cfg=mod_cfg,
+            split_cfg=cfg.get("splitting", {}).get(mod, {}),
+            run_dir=run_dir,
+            mode=args.mode,
+            actual_depth_mm=args.actual_depth_mm,
+            fusion_min_weight=fusion_min_weight,
+        )
+        batch_quality["models"].update(result.model_quality)
+        batch_quality["modality_fusions"].update(result.fusion_quality)
+        setup_audit["models"].update(result.model_setups)
+        setup_audit["warnings"].extend(result.warnings)
+        apples["models"].update(result.model_apples)
 
-            infer_classical(
-                bundle_path=bundle_path,
-                features_csv=air_features_csv,
-                out_csv=air_classical_csv,
-                snap_predictions=cls_cfg.get("snap_predictions", None),
-                doe_step_mm=cls_cfg.get("snap_step_mm", None),
+        if result.fused_bundle is not None:
+            fused_bundles.append(result.fused_bundle)
+            q = result.fusion_quality.get(result.fused_bundle.modality, {})
+            apples["modality_fusions"][result.fused_bundle.modality] = _apples_entry(
+                ref_mae=float(result.fused_bundle.validation_mae),
+                batch_mae=q.get("mae_mm"),
+                diagnostics=_bundle_diagnostics(result.fused_bundle),
             )
+        if result.fused_long_bundle is not None:
+            fused_long_bundles.append(result.fused_long_bundle)
 
-        # DL
-        dl_cfg = air_cfg.get("dl", {})
-        air_dl_csv = run_dir / "airborne" / "dl_predictions.csv"
-        air_dl_fusion_mae: float | None = None
-        air_dl_fusion_mae_source = ""
-        air_dl_model_dir: Path | None = None
-        if dl_cfg.get("enabled", True) and dl_cfg.get("model_dir"):
-            air_dl_model_dir = Path(dl_cfg["model_dir"])
-            air_dl_fusion_mae, air_dl_fusion_mae_source = _resolve_dl_fusion_mae(
-                model_dir=air_dl_model_dir,
-                cfg_mae_fallback=_config_mae_fallback(dl_cfg),
-            )
-            _infer_dl_on_segments(
-                model_dir=air_dl_model_dir,
-                segments_dir=seg_dir_air,
-                file_glob=None,
-                device=str(dl_cfg.get("device", "auto")),
-                batch_size=dl_cfg.get("batch_size", None),
-                out_csv=air_dl_csv,
-                h5_data_key="measurement/data",
-                h5_time_key="measurement/time_vector",
-                include_recording_roots=air_roots,
-            )
-
-        # Fuse intra-modality if both exist
-        if air_classical_csv.exists() and air_dl_csv.exists():
-            if air_classical_fusion_mae is None or air_dl_fusion_mae is None:
-                raise RuntimeError("Missing resolved MAE for airborne intra-fusion.")
-            air_cls_bundle = _bundle_from_pred_csv(
-                air_classical_csv,
-                "airborne_classical",
-                fusion_mae=air_classical_fusion_mae,
-                fusion_mae_source=air_classical_fusion_mae_source,
-            )
-            batch_quality["models"]["airborne_classical"] = _quality_entry(
-                air_cls_bundle, predictions_csv=air_classical_csv, run_dir=run_dir
-            )
-            air_cls_ref_snap = (
-                _read_training_reference_snapped_mae_mm(
-                    _classical_model_root_from_bundle_path(air_classical_bundle_path)
-                )
-                if air_classical_bundle_path is not None
-                else None
-            )
-            air_cls_step = (
-                float(air_classical_bundle_obj.get("doe_step_mm"))
-                if air_classical_bundle_obj
-                and air_classical_bundle_obj.get("doe_step_mm") is not None
-                else 0.1
-            )
-            air_cls_raw = batch_quality["models"]["airborne_classical"]["mae_mm"]
-            apples_to_apples["models"]["airborne_classical"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=air_classical_fusion_mae,
-                reference_mae_snapped_mm=air_cls_ref_snap,
-                new_batch_mae_raw_mm=air_cls_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(air_cls_bundle, air_cls_step),
-                diagnostics=_bundle_pred_diagnostics(air_cls_bundle),
-            )
-            cls_setup, cls_warn = _classical_setup_snapshot(
-                model_key="airborne_classical",
-                bundle_path=air_classical_bundle_path,
-                bundle_obj=air_classical_bundle_obj,
-                reference_mae_source=air_classical_fusion_mae_source,
-                reference_mae_mm=air_classical_fusion_mae,
-                runtime_pred_csv=air_classical_csv,
-                runtime_features_csv=air_features_csv,
-                runtime_extraction_replay=air_runtime_extraction_replay,
-                run_dir=run_dir,
-            )
-            setup_audit["models"]["airborne_classical"] = cls_setup
-            setup_audit["warnings"].extend(cls_warn)
-            air_dl_bundle = _bundle_from_pred_csv(
-                air_dl_csv,
-                "airborne_dl",
-                fusion_mae=air_dl_fusion_mae,
-                fusion_mae_source=air_dl_fusion_mae_source,
-            )
-            batch_quality["models"]["airborne_dl"] = _quality_entry(
-                air_dl_bundle, predictions_csv=air_dl_csv, run_dir=run_dir
-            )
-            air_dl_raw = batch_quality["models"]["airborne_dl"]["mae_mm"]
-            apples_to_apples["models"]["airborne_dl"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=air_dl_fusion_mae,
-                new_batch_mae_raw_mm=air_dl_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(air_dl_bundle, 0.1),
-                diagnostics=_bundle_pred_diagnostics(air_dl_bundle),
-            )
-            setup_audit["models"]["airborne_dl"] = _dl_setup_snapshot(
-                model_key="airborne_dl",
-                model_dir=air_dl_model_dir,
-                reference_mae_source=air_dl_fusion_mae_source,
-                reference_mae_mm=air_dl_fusion_mae,
-                run_dir=run_dir,
-            )
-            air_fused = fuse_intra_modality(
-                air_cls_bundle,
-                air_dl_bundle,
-                modality_name="airborne_ensemble",
-                min_weight=fusion_min_weight,
-            )
-            air_fusion_csv = _save_bundle_predictions_csv(
-                air_fused,
-                air_fusion_csv_path,
-            )
-            batch_quality["modality_fusions"]["airborne_ensemble"] = _quality_entry(
-                air_fused,
-                predictions_csv=air_fusion_csv,
-                run_dir=run_dir,
-            )
-            fused_modality_bundles.append(air_fused)
-        elif air_dl_csv.exists() and not air_classical_csv.exists():
-            # Allow single-model airborne modality when classical inference is unavailable.
-            if air_dl_fusion_mae is None:
-                raise RuntimeError("Missing resolved MAE for airborne DL bundle.")
-            air_dl_bundle = _bundle_from_pred_csv(
-                air_dl_csv,
-                "airborne_dl",
-                fusion_mae=air_dl_fusion_mae,
-                fusion_mae_source=air_dl_fusion_mae_source,
-            )
-            batch_quality["models"]["airborne_dl"] = _quality_entry(
-                air_dl_bundle, predictions_csv=air_dl_csv, run_dir=run_dir
-            )
-            air_dl_raw = batch_quality["models"]["airborne_dl"]["mae_mm"]
-            apples_to_apples["models"]["airborne_dl"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=air_dl_fusion_mae,
-                new_batch_mae_raw_mm=air_dl_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(air_dl_bundle, 0.1),
-                diagnostics=_bundle_pred_diagnostics(air_dl_bundle),
-            )
-            setup_audit["models"]["airborne_dl"] = _dl_setup_snapshot(
-                model_key="airborne_dl",
-                model_dir=air_dl_model_dir,
-                reference_mae_source=air_dl_fusion_mae_source,
-                reference_mae_mm=air_dl_fusion_mae,
-                run_dir=run_dir,
-            )
-            b = _bundle_from_pred_csv(
-                air_dl_csv,
-                "airborne_ensemble",
-                fusion_mae=air_dl_fusion_mae,
-                fusion_mae_source=air_dl_fusion_mae_source,
-            )
-            air_fusion_csv = _save_bundle_predictions_csv(
-                b,
-                air_fusion_csv_path,
-            )
-            batch_quality["modality_fusions"]["airborne_ensemble"] = _quality_entry(
-                b,
-                predictions_csv=air_fusion_csv,
-                run_dir=run_dir,
-            )
-            fused_modality_bundles.append(b)
-        elif air_classical_csv.exists() and not air_dl_csv.exists():
-            if air_classical_fusion_mae is None:
-                raise RuntimeError("Missing resolved MAE for airborne classical bundle.")
-            air_cls_bundle = _bundle_from_pred_csv(
-                air_classical_csv,
-                "airborne_classical",
-                fusion_mae=air_classical_fusion_mae,
-                fusion_mae_source=air_classical_fusion_mae_source,
-            )
-            batch_quality["models"]["airborne_classical"] = _quality_entry(
-                air_cls_bundle, predictions_csv=air_classical_csv, run_dir=run_dir
-            )
-            air_cls_ref_snap = (
-                _read_training_reference_snapped_mae_mm(
-                    _classical_model_root_from_bundle_path(air_classical_bundle_path)
-                )
-                if air_classical_bundle_path is not None
-                else None
-            )
-            air_cls_step = (
-                float(air_classical_bundle_obj.get("doe_step_mm"))
-                if air_classical_bundle_obj
-                and air_classical_bundle_obj.get("doe_step_mm") is not None
-                else 0.1
-            )
-            air_cls_raw = batch_quality["models"]["airborne_classical"]["mae_mm"]
-            apples_to_apples["models"]["airborne_classical"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=air_classical_fusion_mae,
-                reference_mae_snapped_mm=air_cls_ref_snap,
-                new_batch_mae_raw_mm=air_cls_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(air_cls_bundle, air_cls_step),
-                diagnostics=_bundle_pred_diagnostics(air_cls_bundle),
-            )
-            cls_setup, cls_warn = _classical_setup_snapshot(
-                model_key="airborne_classical",
-                bundle_path=air_classical_bundle_path,
-                bundle_obj=air_classical_bundle_obj,
-                reference_mae_source=air_classical_fusion_mae_source,
-                reference_mae_mm=air_classical_fusion_mae,
-                runtime_pred_csv=air_classical_csv,
-                runtime_features_csv=air_features_csv,
-                runtime_extraction_replay=air_runtime_extraction_replay,
-                run_dir=run_dir,
-            )
-            setup_audit["models"]["airborne_classical"] = cls_setup
-            setup_audit["warnings"].extend(cls_warn)
-            b = _bundle_from_pred_csv(
-                air_classical_csv,
-                "airborne_ensemble",
-                fusion_mae=air_classical_fusion_mae,
-                fusion_mae_source=air_classical_fusion_mae_source,
-            )
-            air_fusion_csv = _save_bundle_predictions_csv(
-                b,
-                air_fusion_csv_path,
-            )
-            batch_quality["modality_fusions"]["airborne_ensemble"] = _quality_entry(
-                b,
-                predictions_csv=air_fusion_csv,
-                run_dir=run_dir,
-            )
-            fused_modality_bundles.append(b)
-
-    # Structure (optional, mirrors airborne)
-    st_models_cfg = cfg.get("models", {}).get("structure", {})
-    st_any_enabled = bool(st_models_cfg.get("classical", {}).get("enabled", False)) or bool(
-        st_models_cfg.get("dl", {}).get("enabled", False)
-    )
-    if seg_dir_str is not None and st_any_enabled:
-        st_cfg = cfg["models"]["structure"]
-
-        cls_cfg = st_cfg.get("classical", {})
-        dl_cfg = st_cfg.get("dl", {})
-
-        st_classical_csv = run_dir / "structure" / "classical_predictions.csv"
-        st_features_csv = run_dir / "structure" / "features_structure.csv"
-        st_dl_csv = run_dir / "structure" / "dl_predictions.csv"
-        st_fusion_csv_path = run_dir / "structure" / "fusion_predictions.csv"
-        st_runtime_extraction_replay: dict[str, Any] | None = None
-        st_classical_fusion_mae: float | None = None
-        st_classical_fusion_mae_source = ""
-        st_classical_bundle_path: Path | None = None
-        st_classical_bundle_obj: dict[str, Any] | None = None
-        st_dl_fusion_mae: float | None = None
-        st_dl_fusion_mae_source = ""
-        st_dl_model_dir: Path | None = None
-
-        if cls_cfg.get("enabled", False) and cls_cfg.get("bundle_path"):
-            bundle_path = Path(cls_cfg["bundle_path"])
-            bundle = joblib.load(bundle_path)
-            st_classical_bundle_path = bundle_path
-            st_classical_bundle_obj = bundle
-            st_classical_fusion_mae, st_classical_fusion_mae_source = _resolve_classical_fusion_mae(
-                bundle_path=bundle_path,
-                bundle=bundle,
-                cfg_mae_fallback=_config_mae_fallback(cls_cfg),
-            )
-            feat_cols = None
-            if "feature_cols" in bundle:
-                feat_cols = list(bundle["feature_cols"])
-            elif "members" in bundle and bundle["members"]:
-                feat_cols = list(bundle["members"][0]["feature_cols"])
-
-            feat_cfg_raw = load_config("configs/structure.yaml")
-            feat_cfg_base = feat_cfg_raw.get("classical", feat_cfg_raw)
-            feat_cfg, st_runtime_extraction_replay, cfg_replay_warnings = (
-                _resolve_structure_runtime_extraction_cfg(
-                    bundle_path=bundle_path,
-                    bundle_obj=bundle,
-                    base_cfg=feat_cfg_base,
-                    feature_cols=feat_cols or [],
-                )
-            )
-            logger.info(
-                "Structure classical runtime extraction config source=%s | extractor=%s | "
-                "target_sr_hz=%s",
-                st_runtime_extraction_replay.get("training_extraction_config_source")
-                if st_runtime_extraction_replay
-                else None,
-                feat_cfg.get("extractor"),
-                feat_cfg.get("target_sr_hz"),
-            )
-            for warn_msg in cfg_replay_warnings:
-                logger.warning("%s", warn_msg)
-            setup_audit["warnings"].extend(cfg_replay_warnings)
-            features_df = _extract_for_roots(
-                roots=str_roots,
-                segments_root=seg_dir_str,
-                extractor=extract_structure,
-                cfg=feat_cfg,
-                file_glob=str(feat_cfg.get("file_glob", STRUCTURE_DEFAULT_FILE_GLOB)),
-                n_workers=int(feat_cfg.get("n_workers", STRUCTURE_DEFAULT_N_WORKERS)),
-            )
-            if feat_cols is not None:
-                features_df = _ensure_feature_cols(features_df, feat_cols)
-            st_features_csv.parent.mkdir(parents=True, exist_ok=True)
-            features_df.to_csv(st_features_csv, index=False)
-
-            infer_classical(
-                bundle_path=bundle_path,
-                features_csv=st_features_csv,
-                out_csv=st_classical_csv,
-                snap_predictions=cls_cfg.get("snap_predictions", None),
-                doe_step_mm=cls_cfg.get("snap_step_mm", None),
-            )
-
-        if dl_cfg.get("enabled", False) and dl_cfg.get("model_dir"):
-            st_dl_model_dir = Path(dl_cfg["model_dir"])
-            st_dl_fusion_mae, st_dl_fusion_mae_source = _resolve_dl_fusion_mae(
-                model_dir=st_dl_model_dir,
-                cfg_mae_fallback=_config_mae_fallback(dl_cfg),
-            )
-            st_split = cfg.get("splitting", {}).get("structure", {})
-            _infer_dl_on_segments(
-                model_dir=st_dl_model_dir,
-                segments_dir=seg_dir_str,
-                file_glob=None,
-                device=str(dl_cfg.get("device", "auto")),
-                batch_size=dl_cfg.get("batch_size", None),
-                out_csv=st_dl_csv,
-                h5_data_key=str(st_split.get("h5_data_key", "measurement/data")),
-                h5_time_key=str(st_split.get("h5_time_key", "measurement/time_vector")),
-                include_recording_roots=str_roots,
-            )
-
-        if st_classical_csv.exists() and st_dl_csv.exists():
-            if st_classical_fusion_mae is None or st_dl_fusion_mae is None:
-                raise RuntimeError("Missing resolved MAE for structure intra-fusion.")
-            st_cls_bundle = _bundle_from_pred_csv(
-                st_classical_csv,
-                "structure_classical",
-                fusion_mae=st_classical_fusion_mae,
-                fusion_mae_source=st_classical_fusion_mae_source,
-            )
-            batch_quality["models"]["structure_classical"] = _quality_entry(
-                st_cls_bundle, predictions_csv=st_classical_csv, run_dir=run_dir
-            )
-            st_cls_ref_snap = (
-                _read_training_reference_snapped_mae_mm(
-                    _classical_model_root_from_bundle_path(st_classical_bundle_path)
-                )
-                if st_classical_bundle_path is not None
-                else None
-            )
-            st_cls_step = (
-                float(st_classical_bundle_obj.get("doe_step_mm"))
-                if st_classical_bundle_obj
-                and st_classical_bundle_obj.get("doe_step_mm") is not None
-                else 0.1
-            )
-            st_cls_raw = batch_quality["models"]["structure_classical"]["mae_mm"]
-            apples_to_apples["models"]["structure_classical"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=st_classical_fusion_mae,
-                reference_mae_snapped_mm=st_cls_ref_snap,
-                new_batch_mae_raw_mm=st_cls_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(st_cls_bundle, st_cls_step),
-                diagnostics=_bundle_pred_diagnostics(st_cls_bundle),
-            )
-            cls_setup, cls_warn = _classical_setup_snapshot(
-                model_key="structure_classical",
-                bundle_path=st_classical_bundle_path,
-                bundle_obj=st_classical_bundle_obj,
-                reference_mae_source=st_classical_fusion_mae_source,
-                reference_mae_mm=st_classical_fusion_mae,
-                runtime_pred_csv=st_classical_csv,
-                runtime_features_csv=st_features_csv,
-                runtime_extraction_replay=st_runtime_extraction_replay,
-                run_dir=run_dir,
-            )
-            setup_audit["models"]["structure_classical"] = cls_setup
-            setup_audit["warnings"].extend(cls_warn)
-            st_dl_bundle = _bundle_from_pred_csv(
-                st_dl_csv,
-                "structure_dl",
-                fusion_mae=st_dl_fusion_mae,
-                fusion_mae_source=st_dl_fusion_mae_source,
-            )
-            batch_quality["models"]["structure_dl"] = _quality_entry(
-                st_dl_bundle, predictions_csv=st_dl_csv, run_dir=run_dir
-            )
-            st_dl_raw = batch_quality["models"]["structure_dl"]["mae_mm"]
-            apples_to_apples["models"]["structure_dl"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=st_dl_fusion_mae,
-                new_batch_mae_raw_mm=st_dl_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(st_dl_bundle, 0.1),
-                diagnostics=_bundle_pred_diagnostics(st_dl_bundle),
-            )
-            setup_audit["models"]["structure_dl"] = _dl_setup_snapshot(
-                model_key="structure_dl",
-                model_dir=st_dl_model_dir,
-                reference_mae_source=st_dl_fusion_mae_source,
-                reference_mae_mm=st_dl_fusion_mae,
-                run_dir=run_dir,
-            )
-            st_fused = fuse_intra_modality(
-                st_cls_bundle,
-                st_dl_bundle,
-                modality_name="structure_ensemble",
-                min_weight=fusion_min_weight,
-            )
-            st_fusion_csv = _save_bundle_predictions_csv(
-                st_fused,
-                st_fusion_csv_path,
-            )
-            batch_quality["modality_fusions"]["structure_ensemble"] = _quality_entry(
-                st_fused,
-                predictions_csv=st_fusion_csv,
-                run_dir=run_dir,
-            )
-            fused_modality_bundles.append(st_fused)
-        elif st_dl_csv.exists() and not st_classical_csv.exists():
-            # Allow single-model structure modality for now
-            if st_dl_fusion_mae is None:
-                raise RuntimeError("Missing resolved MAE for structure DL bundle.")
-            st_dl_bundle = _bundle_from_pred_csv(
-                st_dl_csv,
-                "structure_dl",
-                fusion_mae=st_dl_fusion_mae,
-                fusion_mae_source=st_dl_fusion_mae_source,
-            )
-            batch_quality["models"]["structure_dl"] = _quality_entry(
-                st_dl_bundle, predictions_csv=st_dl_csv, run_dir=run_dir
-            )
-            st_dl_raw = batch_quality["models"]["structure_dl"]["mae_mm"]
-            apples_to_apples["models"]["structure_dl"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=st_dl_fusion_mae,
-                new_batch_mae_raw_mm=st_dl_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(st_dl_bundle, 0.1),
-                diagnostics=_bundle_pred_diagnostics(st_dl_bundle),
-            )
-            setup_audit["models"]["structure_dl"] = _dl_setup_snapshot(
-                model_key="structure_dl",
-                model_dir=st_dl_model_dir,
-                reference_mae_source=st_dl_fusion_mae_source,
-                reference_mae_mm=st_dl_fusion_mae,
-                run_dir=run_dir,
-            )
-            b = _bundle_from_pred_csv(
-                st_dl_csv,
-                "structure_ensemble",
-                fusion_mae=st_dl_fusion_mae,
-                fusion_mae_source=st_dl_fusion_mae_source,
-            )
-            st_fusion_csv = _save_bundle_predictions_csv(
-                b,
-                st_fusion_csv_path,
-            )
-            batch_quality["modality_fusions"]["structure_ensemble"] = _quality_entry(
-                b,
-                predictions_csv=st_fusion_csv,
-                run_dir=run_dir,
-            )
-            fused_modality_bundles.append(b)
-        elif st_classical_csv.exists() and not st_dl_csv.exists():
-            if st_classical_fusion_mae is None:
-                raise RuntimeError("Missing resolved MAE for structure classical bundle.")
-            st_cls_bundle = _bundle_from_pred_csv(
-                st_classical_csv,
-                "structure_classical",
-                fusion_mae=st_classical_fusion_mae,
-                fusion_mae_source=st_classical_fusion_mae_source,
-            )
-            batch_quality["models"]["structure_classical"] = _quality_entry(
-                st_cls_bundle, predictions_csv=st_classical_csv, run_dir=run_dir
-            )
-            st_cls_ref_snap = (
-                _read_training_reference_snapped_mae_mm(
-                    _classical_model_root_from_bundle_path(st_classical_bundle_path)
-                )
-                if st_classical_bundle_path is not None
-                else None
-            )
-            st_cls_step = (
-                float(st_classical_bundle_obj.get("doe_step_mm"))
-                if st_classical_bundle_obj
-                and st_classical_bundle_obj.get("doe_step_mm") is not None
-                else 0.1
-            )
-            st_cls_raw = batch_quality["models"]["structure_classical"]["mae_mm"]
-            apples_to_apples["models"]["structure_classical"] = _apples_to_apples_entry(
-                reference_mae_raw_mm=st_classical_fusion_mae,
-                reference_mae_snapped_mm=st_cls_ref_snap,
-                new_batch_mae_raw_mm=st_cls_raw,
-                new_batch_mae_snapped_mm=_snapped_mae_mm(st_cls_bundle, st_cls_step),
-                diagnostics=_bundle_pred_diagnostics(st_cls_bundle),
-            )
-            cls_setup, cls_warn = _classical_setup_snapshot(
-                model_key="structure_classical",
-                bundle_path=st_classical_bundle_path,
-                bundle_obj=st_classical_bundle_obj,
-                reference_mae_source=st_classical_fusion_mae_source,
-                reference_mae_mm=st_classical_fusion_mae,
-                runtime_pred_csv=st_classical_csv,
-                runtime_features_csv=st_features_csv,
-                runtime_extraction_replay=st_runtime_extraction_replay,
-                run_dir=run_dir,
-            )
-            setup_audit["models"]["structure_classical"] = cls_setup
-            setup_audit["warnings"].extend(cls_warn)
-            b = _bundle_from_pred_csv(
-                st_classical_csv,
-                "structure_ensemble",
-                fusion_mae=st_classical_fusion_mae,
-                fusion_mae_source=st_classical_fusion_mae_source,
-            )
-            st_fusion_csv = _save_bundle_predictions_csv(
-                b,
-                st_fusion_csv_path,
-            )
-            batch_quality["modality_fusions"]["structure_ensemble"] = _quality_entry(
-                b,
-                predictions_csv=st_fusion_csv,
-                run_dir=run_dir,
-            )
-            fused_modality_bundles.append(b)
-
-    if not fused_modality_bundles:
-        print(f"Run complete, but no fused modality bundles were produced. Outputs: {run_dir}")
+    if not fused_bundles:
+        print(f"No fused modality bundles produced. Outputs: {run_dir}")
         return
 
-    final = fuse_modalities(
-        *fused_modality_bundles,
-        min_weight=fusion_min_weight,
-    )
+    # Inter-modality fusion
+    final = fuse_modalities(*fused_bundles, min_weight=fusion_min_weight)
     final_dir = run_dir / "final"
-    final_predictions_csv = _save_bundle_predictions_csv(
-        final,
-        final_dir / "final_predictions.csv",
-    )
-    final_quality = _quality_entry(
-        final,
-        predictions_csv=final_predictions_csv,
-        run_dir=run_dir,
-    )
-    setup_audit["run_config_snapshot"] = {
-        "final_prediction_config": str(Path(args.config)),
-        "only": args.only,
-        "force": bool(args.force),
-        "splitting": cfg.get("splitting", {}),
-        "models": cfg.get("models", {}),
-    }
+    final_csv = _save_bundle_predictions_csv(final, final_dir / "final_predictions.csv")
 
-    for mb in fused_modality_bundles:
-        q = batch_quality["modality_fusions"].get(mb.modality, None)
-        if q is None:
-            continue
-        raw_mae = q.get("mae_mm", None)
-        apples_to_apples["modality_fusions"][mb.modality] = _apples_to_apples_entry(
-            reference_mae_raw_mm=float(mb.validation_mae),
-            new_batch_mae_raw_mm=raw_mae,
-            diagnostics=_bundle_pred_diagnostics(mb),
+    final_long_csv: Path | None = None
+    if fused_long_bundles:
+        long_for_fusion = (
+            [
+                PredictionBundle(
+                    modality=b.modality,
+                    record_names=_canonical_long_record_keys(b.record_names),
+                    y_pred=b.y_pred.copy(),
+                    sigma=b.sigma.copy(),
+                    validation_mae=float(b.validation_mae),
+                    y_true=b.y_true.copy() if b.y_true is not None else None,
+                    metadata=dict(b.metadata),
+                )
+                for b in fused_long_bundles
+            ]
+            if len(fused_long_bundles) > 1
+            else fused_long_bundles
+        )
+        final_long = fuse_modalities(*long_for_fusion, min_weight=fusion_min_weight)
+        final_long_csv = _save_bundle_predictions_csv(
+            final_long,
+            final_dir / "final_predictions_long.csv",
         )
 
+    final_quality = _quality_entry(final, predictions_csv=final_csv, run_dir=run_dir)
     batch_quality["final_fusion"] = final_quality
-    apples_to_apples["final_fusion"] = _apples_to_apples_entry(
-        reference_mae_raw_mm=float(final.validation_mae),
-        new_batch_mae_raw_mm=final_quality.get("mae_mm", None),
-        diagnostics=_bundle_pred_diagnostics(final),
+    apples["final_fusion"] = _apples_entry(
+        ref_mae=float(final.validation_mae),
+        batch_mae=final_quality.get("mae_mm"),
+        diagnostics=_bundle_diagnostics(final),
     )
+
+    setup_audit["run_config_snapshot"] = {
+        "final_prediction_config": str(Path(args.config)),
+        "mode": args.mode,
+        "only": args.only,
+        "force": bool(args.force),
+        "actual_depth_mm": args.actual_depth_mm,
+    }
 
     lock_artifacts, lock_warnings = _persist_model_setup_lock(
         setup_audit=setup_audit,
@@ -2443,20 +1800,35 @@ def main() -> None:
     setup_audit["warnings"].extend(lock_warnings)
     setup_audit["warnings"] = sorted(set(str(w) for w in setup_audit["warnings"]))
 
-    with open(final_dir / "batch_quality_report.json", "w", encoding="utf-8") as fh:
-        json.dump(batch_quality, fh, indent=2)
     with open(final_dir / "setup_audit.json", "w", encoding="utf-8") as fh:
         json.dump(setup_audit, fh, indent=2)
-    with open(final_dir / "apples_to_apples_report.json", "w", encoding="utf-8") as fh:
-        json.dump(apples_to_apples, fh, indent=2)
-    if final_quality.get("mae_mm", None) is not None:
-        print(f"Final batch MAE: {float(final_quality['mae_mm']):.6f} mm")
-    print(f"Batch quality report: {final_dir / 'batch_quality_report.json'}")
-    print(f"Setup audit report: {final_dir / 'setup_audit.json'}")
-    print(f"Apples-to-apples report: {final_dir / 'apples_to_apples_report.json'}")
-    print(f"Model setup lock (run): {lock_artifacts.get('run_lock')}")
-    print(f"Model setup lock (latest): {lock_artifacts.get('latest_lock')}")
-    print(f"Final fused predictions: {len(final.y_pred)} rows  {final_predictions_csv}")
+
+    if args.mode == "single":
+        report = _single_prediction_report_payload(
+            run_dir=run_dir,
+            final_predictions_csv=final_csv,
+            final_quality=final_quality,
+            batch_quality=batch_quality,
+            actual_depth_mm=args.actual_depth_mm,
+        )
+        with open(final_dir / "single_prediction_report.json", "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+        if final_quality.get("mae_mm") is not None:
+            print(f"Final single MAE: {float(final_quality['mae_mm']):.6f} mm")
+        print(f"Report: {final_dir / 'single_prediction_report.json'}")
+    else:
+        with open(final_dir / "batch_quality_report.json", "w", encoding="utf-8") as fh:
+            json.dump(batch_quality, fh, indent=2)
+        with open(final_dir / "apples_to_apples_report.json", "w", encoding="utf-8") as fh:
+            json.dump(apples, fh, indent=2)
+        if final_quality.get("mae_mm") is not None:
+            print(f"Final batch MAE: {float(final_quality['mae_mm']):.6f} mm")
+        print(f"Reports: {final_dir}")
+
+    print(f"Setup audit: {final_dir / 'setup_audit.json'}")
+    print(f"Final predictions: {len(final.y_pred)} rows  {final_csv}")
+    if final_long_csv is not None:
+        print(f"Final (long): {len(pd.read_csv(final_long_csv))} rows  {final_long_csv}")
 
 
 if __name__ == "__main__":
