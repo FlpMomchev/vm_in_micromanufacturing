@@ -2,7 +2,7 @@
 
 Virtual metrology pipeline for micro-drilling depth prediction from acoustic sensing (airborne + structure-borne), with classical ML, deep learning, and multi-stage fusion.
 
-## Current Status (2026-03-30)
+## Current Status (2026-03-31)
 
 - Full end-to-end pipeline:
   - split raw recordings into per-hole segments
