@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vm-dashboard-runtime"
 version = "0.1.0"
 description = "Lean runtime for the VM Shiny dashboard and fused prediction launcher."
-requires-python = ">=3.13"
+requires-python = ">=3.11.9"
 
 dependencies = [
     "numpy>=2.0",
