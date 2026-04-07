@@ -62,7 +62,6 @@ def test_save_bundle_predictions_csv_writes_parent_dirs(tmp_path: Path) -> None:
         "sigma",
         "modality",
         "validation_mae",
-        "depth_mm",
         "y_true",
         "residual_mm",
         "abs_residual_mm",

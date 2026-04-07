@@ -15,30 +15,33 @@ dependencies = [
     "numpy>=2.0",
     "scipy>=1.13",
     "pandas>=2.2",
-    "scikit-learn>=1.5",
+    "scikit-learn>=1.5"
 
     # Audio I/O
     "soundfile>=0.12",
-    "librosa>=0.10",
+    "librosa>=0.10"
 
     # Signal / feature processing
     "PyWavelets>=1.6",
     "h5py>=3.11",
-    "openpyxl>=3.1",          # Excel DOE manifest loading
+    "openpyxl>=3.1"          # Excel DOE manifest loading
 
     # Gradient boosting (classical ML)
     "xgboost>=2.0",
     "lightgbm>=4.3",
-    "catboost>=1.2",
+    "catboost>=1.2"
 
     # Config & CLI helpers
     "pyyaml>=6.0",
     "tqdm>=4.66",
-    "joblib>=1.4",
+    "joblib>=1.4"
 
     # Visualisation
     "matplotlib>=3.9",
-    "seaborn>=0.13",
+    "seaborn>=0.13"
+
+    # Automatic file conversion
+    "qass-tools-analyzer>=2.6.3"
 ]
 
 [project.optional-dependencies]
@@ -50,7 +53,7 @@ dev = [
 ]
 
 dl = [
-    "torch>=2.7",
+    "torch>=2.7"
 ]
 
 [project.scripts]

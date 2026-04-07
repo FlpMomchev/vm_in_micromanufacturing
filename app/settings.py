@@ -32,6 +32,7 @@ class AppSettings:
     python_executable: Path
     final_prediction_script: Path
     allowed_extensions: tuple[str, ...]
+    buffer_extensions: tuple[str, ...]
     run_timeout_sec: int
     history_limit: int
 
@@ -77,6 +78,7 @@ def load_settings() -> AppSettings:
             "VM_DASH_FINAL_PREDICTION_SCRIPT", repo_root / "scripts" / "final_prediction.py"
         ),
         allowed_extensions=(".flac", ".wav", ".h5", ".hdf5"),
+        buffer_extensions=(".000",),
         run_timeout_sec=_env_int("VM_DASH_RUN_TIMEOUT_SEC", 6 * 60 * 60),
         history_limit=_env_int("VM_DASH_HISTORY_LIMIT", 50),
     )

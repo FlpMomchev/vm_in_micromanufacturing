@@ -9,6 +9,8 @@ from typing import Iterable
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from vm_micro.data.converter import convert_buffer_to_h5, is_buffer_file
+
 from .db import DashboardDB
 from .settings import AppSettings, load_settings
 
@@ -55,6 +57,10 @@ def _iter_existing_candidate_files(
 
 
 def bootstrap_latest_files(settings: AppSettings, db: DashboardDB) -> None:
+    # Convert any .000 buffer files sitting in the structure folder before
+    # scanning for candidates, so the resulting .h5 files are picked up.
+    _convert_pending_buffers(settings)
+
     for modality in ("airborne", "structure"):
         modality_dir = settings.watch_dir / modality
         candidates = _iter_existing_candidate_files(
@@ -73,15 +79,41 @@ def bootstrap_latest_files(settings: AppSettings, db: DashboardDB) -> None:
         )
 
 
+def _convert_pending_buffers(settings: AppSettings) -> None:
+    """Convert any unconverted .000 files in the structure watch directory."""
+    structure_dir = settings.watch_dir / "structure"
+    if not structure_dir.exists():
+        return
+
+    for path in structure_dir.iterdir():
+        if not path.is_file() or not is_buffer_file(path):
+            continue
+        try:
+            convert_buffer_to_h5(path)
+        except ImportError:
+            logger.warning(
+                "qass package not installed — cannot auto-convert .000 files. "
+                "Place pre-converted .h5 files in the watch directory instead."
+            )
+            return
+        except Exception:
+            logger.exception("Failed to convert buffer file at startup: %s", path.name)
+
+
 class LatestFileEventHandler(FileSystemEventHandler):
     """Watch a folder and keep only the newest relevant file marked as latest."""
 
     def __init__(
-        self, db: DashboardDB, allowed_extensions: Iterable[str], settle_time_sec: float = 0.75
+        self,
+        db: DashboardDB,
+        allowed_extensions: Iterable[str],
+        buffer_extensions: Iterable[str] = (),
+        settle_time_sec: float = 0.75,
     ) -> None:
         super().__init__()
         self.db = db
         self.allowed_extensions = _normalize_extensions(allowed_extensions)
+        self.buffer_extensions = _normalize_extensions(buffer_extensions)
         self.settle_time_sec = float(settle_time_sec)
         self._lock = threading.Lock()
 
@@ -106,6 +138,28 @@ class LatestFileEventHandler(FileSystemEventHandler):
             return
 
         path = Path(candidate).expanduser().resolve()
+
+        # --- auto-convert .000 buffer files --------------------------
+        # The converted .h5 will fire its own on_created event and be
+        # registered through the normal path below.
+        if path.suffix.lower() in self.buffer_extensions:
+            modality = _infer_modality_from_path(path)
+            if modality != "structure":
+                return
+            with self._lock:
+                if not self._wait_until_readable(path):
+                    logger.debug("Skipped unreadable buffer file: %s", path)
+                    return
+                try:
+                    convert_buffer_to_h5(path)
+                except ImportError:
+                    logger.warning(
+                        "qass package not installed — cannot auto-convert %s",
+                        path.name,
+                    )
+                except Exception:
+                    logger.exception("Buffer conversion failed: %s", path.name)
+            return
 
         if path.suffix.lower() not in self.allowed_extensions:
             return
@@ -172,7 +226,11 @@ class LatestFileWatcher:
     def __init__(self, settings: AppSettings, db: DashboardDB) -> None:
         self.settings = settings
         self.db = db
-        self.handler = LatestFileEventHandler(db=db, allowed_extensions=settings.allowed_extensions)
+        self.handler = LatestFileEventHandler(
+            db=db,
+            allowed_extensions=settings.allowed_extensions,
+            buffer_extensions=settings.buffer_extensions,
+        )
         self.observer = Observer()
         self._started = False
 

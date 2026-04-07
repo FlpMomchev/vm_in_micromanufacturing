@@ -617,6 +617,8 @@ def _save_bundle_predictions_csv(bundle: PredictionBundle, out_csv: Path) -> Pat
         df = df.drop(columns=["residual"])
     if "y_true_depth" in df.columns and ("depth_mm" in df.columns or "y_true" in df.columns):
         df = df.drop(columns=["y_true_depth"])
+    if "y_true" in df.columns and "depth_mm" in df.columns:
+        df = df.drop(columns=["depth_mm"])
 
     df.to_csv(out_csv, index=False)
     return out_csv

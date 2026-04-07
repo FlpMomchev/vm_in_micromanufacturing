@@ -25,7 +25,7 @@ splitting:
   # Step=1..expected_segments, HoleID=NA, Depth_mm=None.
   expected_segments:
     default: 25
-    map_xlsx: "models/docs/doe/Experiment_DOE.xlsx"
+    map_xlsx: "docs/doe/Design_of_Experiment.xlsx"
     doe_sheet: "DOE_run_order"
 
   common:
