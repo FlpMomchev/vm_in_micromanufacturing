@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # vm_in_micromanufacturing
 
 Virtual metrology pipeline for micro-drilling depth prediction from acoustic sensing (airborne + structure-borne), with classical ML, deep learning, and multi-stage fusion.
