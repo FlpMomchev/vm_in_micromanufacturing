@@ -68,7 +68,7 @@ def load_settings() -> AppSettings:
     settings = AppSettings(
         repo_root=repo_root,
         data_root=data_root,
-        watch_dir=_env_path("VM_DASH_WATCH_DIR", data_root / "incoming_raw"),
+        watch_dir=_env_path("VM_DASH_WATCH_DIR", data_root / "incoming_raw"),                 #opt. watch_dir=Path(r"G:\..."),
         results_root=_env_path("VM_DASH_RESULTS_ROOT", data_root / "fusion_results"),
         app_state_dir=_env_path("VM_DASH_STATE_DIR", data_root / "dashboard"),
         logs_dir=_env_path("VM_DASH_LOGS_DIR", data_root / "dashboard" / "logs"),
