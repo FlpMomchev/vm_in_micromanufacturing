@@ -78,7 +78,7 @@ models:
     classical:
       enabled: true
       bundle_path: "models/features/structure/default_features/final_models_balanced_v1/final_model/ensemble_model_bundle.joblib"
-      fusion_mae_fallback: 0.03415
+      fusion_mae_fallback: 0.02571
       snap_predictions: false
       snap_step_mm: null
     dl:

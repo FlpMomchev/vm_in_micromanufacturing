@@ -140,14 +140,14 @@ def _downsample_to_target_sr(
     sr = int(sr_native)
     target = int(target_sr_hz)
 
-    # Keep anti-aliasing stable by reducing huge native SR in coarse x10 stages first.
     while sr // 10 >= 2 * target:
         y = decimate(y, 10, ftype="iir", zero_phase=True)
         sr = sr // 10
 
-    if sr != target:
-        y = _safe_resample(y, sr, target)
-        sr = target
+    remaining = sr // target
+    if remaining > 1:
+        y = decimate(y, remaining, ftype="iir", zero_phase=True)
+        sr = sr // remaining
 
     return y, sr
 
