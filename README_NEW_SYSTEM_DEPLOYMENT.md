@@ -77,6 +77,10 @@ Python 3.13 is required.
 From the repository root:
 
 ```powershell
+git clone https://github.com/FlpMomchev/vm_in_micromanufacturing.git .
+
+python -m venv .venv
+
 pip install -e .\dashboard_runtime[dl]
 ```
 
