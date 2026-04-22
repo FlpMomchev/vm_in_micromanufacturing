@@ -16,6 +16,9 @@ from .settings import AppSettings, load_settings
 
 logger = logging.getLogger(__name__)
 
+# Airborne files must contain this substring to be accepted (mic-2).
+_AIRBORNE_NAME_FILTER = "-2_"
+
 
 def _normalize_extensions(values: Iterable[str]) -> tuple[str, ...]:
     normalized: list[str] = []
@@ -27,15 +30,6 @@ def _normalize_extensions(values: Iterable[str]) -> tuple[str, ...]:
             item = f".{item}"
         normalized.append(item)
     return tuple(dict.fromkeys(normalized))
-
-
-def _infer_modality_from_path(path: Path) -> str | None:
-    parent = path.parent.name.lower()
-    if parent == "airborne":
-        return "airborne"
-    if parent == "structure":
-        return "structure"
-    return None
 
 
 def _iter_existing_candidate_files(
@@ -61,12 +55,21 @@ def bootstrap_latest_files(settings: AppSettings, db: DashboardDB) -> None:
     # scanning for candidates, so the resulting .h5 files are picked up.
     _convert_pending_buffers(settings)
 
-    for modality in ("airborne", "structure"):
-        modality_dir = settings.watch_dir / modality
+    modality_dirs = {
+        "airborne": settings.watch_dir_airborne,
+        "structure": settings.watch_dir_structure,
+    }
+
+    for modality, modality_dir in modality_dirs.items():
         candidates = _iter_existing_candidate_files(
             modality_dir,
             settings.allowed_extensions,
         )
+
+        # Apply airborne mic-2 filter.
+        if modality == "airborne":
+            candidates = [p for p in candidates if _AIRBORNE_NAME_FILTER in p.name]
+
         if not candidates:
             continue
 
@@ -81,13 +84,26 @@ def bootstrap_latest_files(settings: AppSettings, db: DashboardDB) -> None:
 
 def _convert_pending_buffers(settings: AppSettings) -> None:
     """Convert any unconverted .000 files in the structure watch directory."""
-    structure_dir = settings.watch_dir / "structure"
+    structure_dir = settings.watch_dir_structure
     if not structure_dir.exists():
         return
 
     for path in structure_dir.iterdir():
         if not path.is_file() or not is_buffer_file(path):
             continue
+
+        # Skip FFT / large files — only convert raw buffers.
+        try:
+            if path.stat().st_size > settings.buffer_max_size_bytes:
+                logger.debug(
+                    "Skipped oversized buffer file (FFT): %s (%.1f MB)",
+                    path.name,
+                    path.stat().st_size / (1024 * 1024),
+                )
+                continue
+        except OSError:
+            continue
+
         try:
             convert_buffer_to_h5(path)
         except ImportError:
@@ -106,16 +122,33 @@ class LatestFileEventHandler(FileSystemEventHandler):
     def __init__(
         self,
         db: DashboardDB,
+        watch_dir_airborne: Path,
+        watch_dir_structure: Path,
         allowed_extensions: Iterable[str],
         buffer_extensions: Iterable[str] = (),
+        buffer_max_size_bytes: int = 400 * 1024 * 1024,
         settle_time_sec: float = 0.75,
     ) -> None:
         super().__init__()
         self.db = db
+        self.watch_dir_airborne = watch_dir_airborne.resolve()
+        self.watch_dir_structure = watch_dir_structure.resolve()
         self.allowed_extensions = _normalize_extensions(allowed_extensions)
         self.buffer_extensions = _normalize_extensions(buffer_extensions)
+        self.buffer_max_size_bytes = buffer_max_size_bytes
         self.settle_time_sec = float(settle_time_sec)
         self._lock = threading.Lock()
+
+    def _infer_modality(self, path: Path) -> str | None:
+        """Infer modality by checking which configured watch dir the file is in."""
+        try:
+            if path.is_relative_to(self.watch_dir_airborne):
+                return "airborne"
+            if path.is_relative_to(self.watch_dir_structure):
+                return "structure"
+        except ValueError:
+            pass
+        return None
 
     def on_created(self, event: FileSystemEvent) -> None:
         self._handle_event(event)
@@ -138,18 +171,31 @@ class LatestFileEventHandler(FileSystemEventHandler):
             return
 
         path = Path(candidate).expanduser().resolve()
+        modality = self._infer_modality(path)
+        if modality is None:
+            return
 
         # --- auto-convert .000 buffer files --------------------------
-        # The converted .h5 will fire its own on_created event and be
-        # registered through the normal path below.
         if path.suffix.lower() in self.buffer_extensions:
-            modality = _infer_modality_from_path(path)
             if modality != "structure":
                 return
             with self._lock:
                 if not self._wait_until_readable(path):
                     logger.debug("Skipped unreadable buffer file: %s", path)
                     return
+
+                # Skip FFT / large files.
+                try:
+                    if path.stat().st_size > self.buffer_max_size_bytes:
+                        logger.debug(
+                            "Skipped oversized buffer file (FFT): %s (%.1f MB)",
+                            path.name,
+                            path.stat().st_size / (1024 * 1024),
+                        )
+                        return
+                except OSError:
+                    return
+
                 try:
                     convert_buffer_to_h5(path)
                 except ImportError:
@@ -164,8 +210,9 @@ class LatestFileEventHandler(FileSystemEventHandler):
         if path.suffix.lower() not in self.allowed_extensions:
             return
 
-        modality = _infer_modality_from_path(path)
-        if modality is None:
+        # --- airborne mic-2 filter -----------------------------------
+        if modality == "airborne" and _AIRBORNE_NAME_FILTER not in path.name:
+            logger.debug("Skipped non-mic-2 airborne file: %s", path.name)
             return
 
         with self._lock:
@@ -228,8 +275,11 @@ class LatestFileWatcher:
         self.db = db
         self.handler = LatestFileEventHandler(
             db=db,
+            watch_dir_airborne=settings.watch_dir_airborne,
+            watch_dir_structure=settings.watch_dir_structure,
             allowed_extensions=settings.allowed_extensions,
             buffer_extensions=settings.buffer_extensions,
+            buffer_max_size_bytes=settings.buffer_max_size_bytes,
         )
         self.observer = Observer()
         self._started = False
@@ -238,12 +288,22 @@ class LatestFileWatcher:
         if self._started:
             return
 
-        self.settings.watch_dir.mkdir(parents=True, exist_ok=True)
-        self.observer.schedule(self.handler, str(self.settings.watch_dir), recursive=True)
+        self.settings.watch_dir_airborne.mkdir(parents=True, exist_ok=True)
+        self.settings.watch_dir_structure.mkdir(parents=True, exist_ok=True)
+
+        # Schedule one watch per modality directory (non-recursive, files
+        # land directly in the folder).
+        self.observer.schedule(
+            self.handler, str(self.settings.watch_dir_airborne), recursive=False,
+        )
+        self.observer.schedule(
+            self.handler, str(self.settings.watch_dir_structure), recursive=False,
+        )
         self.observer.start()
         self._started = True
 
-        logger.info("Watching folder: %s", self.settings.watch_dir)
+        logger.info("Watching airborne: %s", self.settings.watch_dir_airborne)
+        logger.info("Watching structure: %s", self.settings.watch_dir_structure)
         logger.info("Allowed extensions: %s", ", ".join(self.settings.allowed_extensions))
 
     def stop(self) -> None:

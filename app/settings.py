@@ -24,7 +24,8 @@ def _env_int(name: str, default: int) -> int:
 class AppSettings:
     repo_root: Path
     data_root: Path
-    watch_dir: Path
+    watch_dir_airborne: Path
+    watch_dir_structure: Path
     results_root: Path
     app_state_dir: Path
     logs_dir: Path
@@ -33,14 +34,14 @@ class AppSettings:
     final_prediction_script: Path
     allowed_extensions: tuple[str, ...]
     buffer_extensions: tuple[str, ...]
+    buffer_max_size_bytes: int
     run_timeout_sec: int
     history_limit: int
 
     def ensure_directories(self) -> None:
         self.data_root.mkdir(parents=True, exist_ok=True)
-        self.watch_dir.mkdir(parents=True, exist_ok=True)
-        (self.watch_dir / "airborne").mkdir(parents=True, exist_ok=True)
-        (self.watch_dir / "structure").mkdir(parents=True, exist_ok=True)
+        self.watch_dir_airborne.mkdir(parents=True, exist_ok=True)
+        self.watch_dir_structure.mkdir(parents=True, exist_ok=True)
         self.results_root.mkdir(parents=True, exist_ok=True)
         self.app_state_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -64,11 +65,17 @@ class AppSettings:
 def load_settings() -> AppSettings:
     repo_root = Path(__file__).resolve().parents[1]
     data_root = _env_path("VM_DASH_DATA_ROOT", repo_root / "data")
+    incoming_raw = data_root / "incoming_raw"
 
     settings = AppSettings(
         repo_root=repo_root,
         data_root=data_root,
-        watch_dir=_env_path("VM_DASH_WATCH_DIR", data_root / "incoming_raw"),                 #opt. watch_dir=Path(r"G:\..."),
+        watch_dir_airborne=Path(
+            r"F:/raw_data/airborne"), #opt. watch_dir=Path(r"G:\..."),
+                                
+        watch_dir_structure=Path(
+            r"F:/raw_data/structure"), #opt. watch_dir=Path(r"G:\..."),
+
         results_root=_env_path("VM_DASH_RESULTS_ROOT", data_root / "fusion_results"),
         app_state_dir=_env_path("VM_DASH_STATE_DIR", data_root / "dashboard"),
         logs_dir=_env_path("VM_DASH_LOGS_DIR", data_root / "dashboard" / "logs"),
@@ -79,6 +86,9 @@ def load_settings() -> AppSettings:
         ),
         allowed_extensions=(".flac", ".wav", ".h5", ".hdf5"),
         buffer_extensions=(".000",),
+        buffer_max_size_bytes=_env_int(
+            "VM_DASH_BUFFER_MAX_SIZE_BYTES", 400 * 1024 * 1024,
+        ),
         run_timeout_sec=_env_int("VM_DASH_RUN_TIMEOUT_SEC", 6 * 60 * 60),
         history_limit=_env_int("VM_DASH_HISTORY_LIMIT", 50),
     )
