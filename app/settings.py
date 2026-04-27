@@ -70,11 +70,9 @@ def load_settings() -> AppSettings:
     settings = AppSettings(
         repo_root=repo_root,
         data_root=data_root,
-        watch_dir_airborne=Path(
-            r"F:/raw_data/airborne"), #opt. watch_dir=Path(r"G:\..."),
+        watch_dir_airborne=_env_path("VM_DASH_INCOMING_AIR", incoming_raw / "airborne"),
                                 
-        watch_dir_structure=Path(
-            r"F:/raw_data/structure"), #opt. watch_dir=Path(r"G:\..."),
+        watch_dir_structure=_env_path("VM_DASH_INCOMING_STR", incoming_raw / "structure"),
 
         results_root=_env_path("VM_DASH_RESULTS_ROOT", data_root / "fusion_results"),
         app_state_dir=_env_path("VM_DASH_STATE_DIR", data_root / "dashboard"),

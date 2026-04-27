@@ -24,15 +24,16 @@ splitting:
   # If no DOE manifest is provided, a dummy DOE is created with:
   # Step=1..expected_segments, HoleID=NA, Depth_mm=None.
   expected_segments:
-    default: 25
+    default: 49
     map_xlsx: "docs/doe/Design_of_Experiment.xlsx"
     doe_sheet: "DOE_run_order"
 
   common:
-    band_low_hz: 2700.0
-    band_high_hz: 3300.0
+    band_low_hz: 2000.0
+    band_high_hz: 5000.0
     # Optional fallback detection bands tried in order
     band_fallbacks_hz:
+      - [2700.0, 3300.0]
       - [2200.0, 2700.0]
       - [2000.0, 2500.0]
       - [3000.0, 3500.0]
